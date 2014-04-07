@@ -1,5 +1,5 @@
-python-kafka (0.8.0-1~20131127-1) unstable; urgency=low
+python-kafka (0.8.0-1) unstable; urgency=low
 
   * Initial release
 
- -- Andrew Otto (WMF) <otto@wikimedia.org>  Tue, 26 Nov 2013 21:29:02 +0000
+ -- Andrew Otto (WMF) <otto@wikimedia.org>  Tue, 7 Apr 2014 19:59:00 +0000
