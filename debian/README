@@ -1,0 +1,16 @@
+This debianization is meant to track upstream from https://github.com/mumrah/kafka-python.
+To do so, you should set your upstream remote to that, like
+
+  git remote add upstream https://github.com/mumrah/kafka-python.git
+
+To build a new version of python-kafka based on a new upstream tag, do:
+
+  git fetch --all
+  git checkout debian
+  git merge -s recursive -X theirs vX.X.X
+  git push gerrit debian
+  dch -i   # increment the changelog version
+  git commit -a -m 'Update to version X.X.X'
+  git review debian
+  git-buildpackage
+
