@@ -2,22 +2,18 @@ from __future__ import absolute_import
 
 try:
     from itertools import zip_longest as izip_longest, repeat  # pylint: disable-msg=E0611
-except ImportError:  # python 2
-    from itertools import izip_longest as izip_longest, repeat
+except ImportError:
+    from itertools import izip_longest as izip_longest, repeat # python 2
 import logging
+try:
+    from Queue import Empty, Queue # python 3
+except ImportError:
+    from queue import Empty, Queue # python 2
+import sys
 import time
 
 import six
 
-try:
-    from Queue import Empty, Queue
-except ImportError:  # python 2
-    from queue import Empty, Queue
-
-from kafka.common import (
-    FetchRequest, OffsetRequest,
-    ConsumerFetchSizeTooSmall, ConsumerNoMoreData
-)
 from .base import (
     Consumer,
     FETCH_DEFAULT_BLOCK_TIMEOUT,
@@ -30,8 +26,16 @@ from .base import (
     ITER_TIMEOUT_SECONDS,
     NO_MESSAGES_WAIT_TIME_SECONDS
 )
+from ..common import (
+    FetchRequest, KafkaError, OffsetRequest,
+    ConsumerFetchSizeTooSmall, ConsumerNoMoreData,
+    UnknownTopicOrPartitionError, NotLeaderForPartitionError,
+    OffsetOutOfRangeError, FailedPayloadsError, check_error
+)
 
-log = logging.getLogger("kafka")
+
+log = logging.getLogger(__name__)
+
 
 class FetchContext(object):
     """
@@ -70,6 +74,8 @@ class SimpleConsumer(Consumer):
     Arguments:
         client: a connected KafkaClient
         group: a name for this consumer, used for offset storage and must be unique
+            If you are connecting to a server that does not support offset
+            commit/fetch (any prior to 0.8.1.1), then you *must* set this to None
         topic: the topic to consume
 
     Keyword Arguments:
@@ -94,6 +100,10 @@ class SimpleConsumer(Consumer):
              message in the iterator before exiting. None means no
              timeout, so it will wait forever.
 
+        auto_offset_reset: default largest. Reset partition offsets upon
+             OffsetOutOfRangeError. Valid values are largest and smallest.
+             Otherwise, do not reset the offsets and raise OffsetOutOfRangeError.
+
     Auto commit details:
     If both auto_commit_every_n and auto_commit_every_t are set, they will
     reset one another when one is triggered. These triggers simply call the
@@ -106,7 +116,8 @@ class SimpleConsumer(Consumer):
                  fetch_size_bytes=FETCH_MIN_BYTES,
                  buffer_size=FETCH_BUFFER_SIZE_BYTES,
                  max_buffer_size=MAX_FETCH_BUFFER_SIZE_BYTES,
-                 iter_timeout=None):
+                 iter_timeout=None,
+                 auto_offset_reset='largest'):
         super(SimpleConsumer, self).__init__(
             client, group, topic,
             partitions=partitions,
@@ -115,8 +126,8 @@ class SimpleConsumer(Consumer):
             auto_commit_every_t=auto_commit_every_t)
 
         if max_buffer_size is not None and buffer_size > max_buffer_size:
-            raise ValueError("buffer_size (%d) is greater than "
-                             "max_buffer_size (%d)" %
+            raise ValueError('buffer_size (%d) is greater than '
+                             'max_buffer_size (%d)' %
                              (buffer_size, max_buffer_size))
         self.buffer_size = buffer_size
         self.max_buffer_size = max_buffer_size
@@ -125,11 +136,51 @@ class SimpleConsumer(Consumer):
         self.fetch_min_bytes = fetch_size_bytes
         self.fetch_offsets = self.offsets.copy()
         self.iter_timeout = iter_timeout
+        self.auto_offset_reset = auto_offset_reset
         self.queue = Queue()
 
     def __repr__(self):
         return '<SimpleConsumer group=%s, topic=%s, partitions=%s>' % \
             (self.group, self.topic, str(self.offsets.keys()))
+
+    def reset_partition_offset(self, partition):
+        """Update offsets using auto_offset_reset policy (smallest|largest)
+
+        Arguments:
+            partition (int): the partition for which offsets should be updated
+
+        Returns: Updated offset on success, None on failure
+        """
+        LATEST = -1
+        EARLIEST = -2
+        if self.auto_offset_reset == 'largest':
+            reqs = [OffsetRequest(self.topic, partition, LATEST, 1)]
+        elif self.auto_offset_reset == 'smallest':
+            reqs = [OffsetRequest(self.topic, partition, EARLIEST, 1)]
+        else:
+            # Let's raise an reasonable exception type if user calls
+            # outside of an exception context
+            if sys.exc_info() == (None, None, None):
+                raise OffsetOutOfRangeError('Cannot reset partition offsets without a '
+                                            'valid auto_offset_reset setting '
+                                            '(largest|smallest)')
+            # Otherwise we should re-raise the upstream exception
+            # b/c it typically includes additional data about
+            # the request that triggered it, and we do not want to drop that
+            raise
+
+        # send_offset_request
+        log.info('Resetting topic-partition offset to %s for %s:%d',
+                 self.auto_offset_reset, self.topic, partition)
+        try:
+            (resp, ) = self.client.send_offset_request(reqs)
+        except KafkaError as e:
+            log.error('%s sending offset request for %s:%d',
+                      e.__class__.__name__, self.topic, partition)
+        else:
+            self.offsets[partition] = resp.offsets[0]
+            self.fetch_offsets[partition] = resp.offsets[0]
+            return resp.offsets[0]
 
     def provide_partition_info(self):
         """
@@ -176,12 +227,12 @@ class SimpleConsumer(Consumer):
                 self.offsets[resp.partition] = \
                     resp.offsets[0] + deltas[resp.partition]
         else:
-            raise ValueError("Unexpected value for `whence`, %d" % whence)
+            raise ValueError('Unexpected value for `whence`, %d' % whence)
 
         # Reset queue and fetch offsets since they are invalid
         self.fetch_offsets = self.offsets.copy()
+        self.count_since_commit += 1
         if self.auto_commit:
-            self.count_since_commit += 1
             self.commit()
 
         self.queue = Queue()
@@ -199,35 +250,32 @@ class SimpleConsumer(Consumer):
         """
         messages = []
         if timeout is not None:
-            max_time = time.time() + timeout
+            timeout += time.time()
 
         new_offsets = {}
-        while count > 0 and (timeout is None or timeout > 0):
-            result = self._get_message(block, timeout, get_partition_info=True,
+        log.debug('getting %d messages', count)
+        while len(messages) < count:
+            block_time = timeout - time.time()
+            log.debug('calling _get_message block=%s timeout=%s', block, block_time)
+            result = self._get_message(block, block_time,
+                                       get_partition_info=True,
                                        update_offset=False)
-            if result:
-                partition, message = result
-                if self.partition_info:
-                    messages.append(result)
-                else:
-                    messages.append(message)
-                new_offsets[partition] = message.offset + 1
-                count -= 1
-            else:
-                # Ran out of messages for the last request.
-                if not block:
-                    # If we're not blocking, break.
-                    break
+            log.debug('got %s from _get_messages', result)
+            if not result:
+                if block and (timeout is None or time.time() <= timeout):
+                    continue
+                break
 
-            # If we have a timeout, reduce it to the
-            # appropriate value
-            if timeout is not None:
-                timeout = max_time - time.time()
+            partition, message = result
+            _msg = (partition, message) if self.partition_info else message
+            messages.append(_msg)
+            new_offsets[partition] = message.offset + 1
 
         # Update and commit offsets if necessary
         self.offsets.update(new_offsets)
         self.count_since_commit += len(messages)
         self._auto_commit()
+        log.debug('got %d messages: %s', len(messages), messages)
         return messages
 
     def get_message(self, block=True, timeout=0.1, get_partition_info=None):
@@ -241,10 +289,16 @@ class SimpleConsumer(Consumer):
         If get_partition_info is True, returns (partition, message)
         If get_partition_info is False, returns message
         """
-        if self.queue.empty():
+        start_at = time.time()
+        while self.queue.empty():
             # We're out of messages, go grab some more.
+            log.debug('internal queue empty, fetching more messages')
             with FetchContext(self, block, timeout):
                 self._fetch()
+
+            if not block or time.time() > (start_at + timeout):
+                break
+
         try:
             partition, message = self.queue.get_nowait()
 
@@ -263,6 +317,7 @@ class SimpleConsumer(Consumer):
             else:
                 return message
         except Empty:
+            log.debug('internal queue empty after fetch - returning None')
             return None
 
     def __iter__(self):
@@ -297,21 +352,55 @@ class SimpleConsumer(Consumer):
             responses = self.client.send_fetch_request(
                 requests,
                 max_wait_time=int(self.fetch_max_wait_time),
-                min_bytes=self.fetch_min_bytes)
+                min_bytes=self.fetch_min_bytes,
+                fail_on_error=False
+            )
 
             retry_partitions = {}
             for resp in responses:
+
+                try:
+                    check_error(resp)
+                except UnknownTopicOrPartitionError:
+                    log.error('UnknownTopicOrPartitionError for %s:%d',
+                              resp.topic, resp.partition)
+                    self.client.reset_topic_metadata(resp.topic)
+                    raise
+                except NotLeaderForPartitionError:
+                    log.error('NotLeaderForPartitionError for %s:%d',
+                              resp.topic, resp.partition)
+                    self.client.reset_topic_metadata(resp.topic)
+                    continue
+                except OffsetOutOfRangeError:
+                    log.warning('OffsetOutOfRangeError for %s:%d. '
+                                'Resetting partition offset...',
+                                resp.topic, resp.partition)
+                    self.reset_partition_offset(resp.partition)
+                    # Retry this partition
+                    retry_partitions[resp.partition] = partitions[resp.partition]
+                    continue
+                except FailedPayloadsError as e:
+                    log.warning('FailedPayloadsError for %s:%d',
+                                e.payload.topic, e.payload.partition)
+                    # Retry this partition
+                    retry_partitions[e.payload.partition] = partitions[e.payload.partition]
+                    continue
+
                 partition = resp.partition
                 buffer_size = partitions[partition]
                 try:
                     for message in resp.messages:
+                        if message.offset < self.fetch_offsets[partition]:
+                            log.debug('Skipping message %s because its offset is less than the consumer offset',
+                                      message)
+                            continue
                         # Put the message in our queue
                         self.queue.put((partition, message))
                         self.fetch_offsets[partition] = message.offset + 1
                 except ConsumerFetchSizeTooSmall:
                     if (self.max_buffer_size is not None and
                             buffer_size == self.max_buffer_size):
-                        log.error("Max fetch size %d too small",
+                        log.error('Max fetch size %d too small',
                                   self.max_buffer_size)
                         raise
                     if self.max_buffer_size is None:
@@ -319,12 +408,12 @@ class SimpleConsumer(Consumer):
                     else:
                         buffer_size = min(buffer_size * 2,
                                           self.max_buffer_size)
-                    log.warn("Fetch size too small, increase to %d (2x) "
-                             "and retry", buffer_size)
+                    log.warning('Fetch size too small, increase to %d (2x) '
+                                'and retry', buffer_size)
                     retry_partitions[partition] = buffer_size
                 except ConsumerNoMoreData as e:
-                    log.debug("Iteration was ended by %r", e)
+                    log.debug('Iteration was ended by %r', e)
                 except StopIteration:
                     # Stop iterating through this partition
-                    log.debug("Done iterating over partition %s" % partition)
+                    log.debug('Done iterating over partition %s', partition)
             partitions = retry_partitions
