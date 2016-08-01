@@ -1,3 +1,9 @@
+python-kafka (1.2.5-1) stable; urgency=low
+
+  * 1.2.5 release
+
+ -- Andrew Otto <otto@wikimedia.org>  Wed, 01 Aug 2016 14:28:19 +0000
+
 python-kafka (0.9.4-1) stable; urgency=low
 
   * 0.9.4 release
