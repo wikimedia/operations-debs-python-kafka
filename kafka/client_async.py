@@ -1,4 +1,4 @@
-from __future__ import absolute_import
+from __future__ import absolute_import, division
 
 import copy
 import functools
@@ -6,26 +6,30 @@ import heapq
 import itertools
 import logging
 import random
+import threading
 
 # selectors in stdlib as of py3.4
 try:
     import selectors # pylint: disable=import-error
 except ImportError:
     # vendored backport module
-    from . import selectors34 as selectors
+    from .vendor import selectors34 as selectors
 
 import socket
 import time
 
-import six
+from kafka.vendor import six
 
 from .cluster import ClusterMetadata
 from .conn import BrokerConnection, ConnectionStates, collect_hosts, get_ip_port_afi
 from . import errors as Errors
 from .future import Future
+from .metrics import AnonMeasurable
+from .metrics.stats import Avg, Count, Rate
+from .metrics.stats.rate import TimeUnit
 from .protocol.metadata import MetadataRequest
 from .protocol.produce import ProduceRequest
-from . import socketpair
+from .vendor import socketpair
 from .version import __version__
 
 if six.PY2:
@@ -51,6 +55,7 @@ class KafkaClient(object):
         'max_in_flight_requests_per_connection': 5,
         'receive_buffer_bytes': None,
         'send_buffer_bytes': None,
+        'socket_options': [(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)],
         'retry_backoff_ms': 100,
         'metadata_max_age_ms': 300000,
         'security_protocol': 'PLAINTEXT',
@@ -61,7 +66,22 @@ class KafkaClient(object):
         'ssl_keyfile': None,
         'ssl_password': None,
         'ssl_crlfile': None,
+        'api_version': None,
+        'api_version_auto_timeout_ms': 2000,
+        'selector': selectors.DefaultSelector,
+        'metrics': None,
+        'metric_group_prefix': '',
+        'sasl_mechanism': None,
+        'sasl_plain_username': None,
+        'sasl_plain_password': None,
     }
+    API_VERSIONS = [
+        (0, 10),
+        (0, 9),
+        (0, 8, 2),
+        (0, 8, 1),
+        (0, 8, 0)
+    ]
 
     def __init__(self, **configs):
         """Initialize an asynchronous kafka client
@@ -78,26 +98,29 @@ class KafkaClient(object):
                 server-side log entries that correspond to this client. Also
                 submitted to GroupCoordinator for logging with respect to
                 consumer group administration. Default: 'kafka-python-{version}'
-            request_timeout_ms (int): Client request timeout in milliseconds.
-                Default: 40000.
             reconnect_backoff_ms (int): The amount of time in milliseconds to
                 wait before attempting to reconnect to a given host.
                 Default: 50.
+            request_timeout_ms (int): Client request timeout in milliseconds.
+                Default: 40000.
+            retry_backoff_ms (int): Milliseconds to backoff when retrying on
+                errors. Default: 100.
             max_in_flight_requests_per_connection (int): Requests are pipelined
                 to kafka brokers up to this number of maximum requests per
                 broker connection. Default: 5.
-            send_buffer_bytes (int): The size of the TCP send buffer
-                (SO_SNDBUF) to use when sending data. Default: None (relies on
-                system defaults). Java client defaults to 131072.
             receive_buffer_bytes (int): The size of the TCP receive buffer
                 (SO_RCVBUF) to use when reading data. Default: None (relies on
                 system defaults). Java client defaults to 32768.
+            send_buffer_bytes (int): The size of the TCP send buffer
+                (SO_SNDBUF) to use when sending data. Default: None (relies on
+                system defaults). Java client defaults to 131072.
+            socket_options (list): List of tuple-arguments to socket.setsockopt
+                to apply to broker connection sockets. Default:
+                [(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)]
             metadata_max_age_ms (int): The period of time in milliseconds after
                 which we force a refresh of metadata even if we haven't seen any
                 partition leadership changes to proactively discover any new
                 brokers or partitions. Default: 300000
-            retry_backoff_ms (int): Milliseconds to backoff when retrying on
-                errors. Default: 100.
             security_protocol (str): Protocol used to communicate with brokers.
                 Valid values are: PLAINTEXT, SSL. Default: PLAINTEXT.
             ssl_context (ssl.SSLContext): pre-configured SSLContext for wrapping
@@ -118,17 +141,42 @@ class KafkaClient(object):
                 providing a file, only the leaf certificate will be checked against
                 this CRL. The CRL can only be checked with Python 3.4+ or 2.7.9+.
                 default: none.
+            api_version (tuple): specify which kafka API version to use. Accepted
+                values are: (0, 8, 0), (0, 8, 1), (0, 8, 2), (0, 9), (0, 10)
+                If None, KafkaClient will attempt to infer the broker
+                version by probing various APIs. Default: None
+            api_version_auto_timeout_ms (int): number of milliseconds to throw a
+                timeout exception from the constructor when checking the broker
+                api version. Only applies if api_version is None
+            selector (selectors.BaseSelector): Provide a specific selector
+                implementation to use for I/O multiplexing.
+                Default: selectors.DefaultSelector
+            metrics (kafka.metrics.Metrics): Optionally provide a metrics
+                instance for capturing network IO stats. Default: None.
+            metric_group_prefix (str): Prefix for metric names. Default: ''
+            sasl_mechanism (str): string picking sasl mechanism when security_protocol
+                is SASL_PLAINTEXT or SASL_SSL. Currently only PLAIN is supported.
+                Default: None
+            sasl_plain_username (str): username for sasl PLAIN authentication.
+                Default: None
+            sasl_plain_password (str): password for sasl PLAIN authentication.
+                Defualt: None
         """
         self.config = copy.copy(self.DEFAULT_CONFIG)
         for key in self.config:
             if key in configs:
                 self.config[key] = configs[key]
 
+        if self.config['api_version'] is not None:
+            assert self.config['api_version'] in self.API_VERSIONS, (
+                'api_version [{0}] must be one of: {1}'.format(
+                    self.config['api_version'], str(self.API_VERSIONS)))
+
         self.cluster = ClusterMetadata(**self.config)
         self._topics = set() # empty set will fetch all topic metadata
         self._metadata_refresh_in_progress = False
         self._last_no_node_available_ms = 0
-        self._selector = selectors.DefaultSelector()
+        self._selector = self.config['selector']()
         self._conns = {}
         self._connecting = set()
         self._refresh_on_disconnects = True
@@ -137,9 +185,21 @@ class KafkaClient(object):
         self._bootstrap_fails = 0
         self._wake_r, self._wake_w = socket.socketpair()
         self._wake_r.setblocking(False)
+        self._wake_lock = threading.Lock()
         self._selector.register(self._wake_r, selectors.EVENT_READ)
         self._closed = False
+        self._sensors = None
+        if self.config['metrics']:
+            self._sensors = KafkaClientMetrics(self.config['metrics'],
+                                               self.config['metric_group_prefix'],
+                                               self._conns)
+
         self._bootstrap(collect_hosts(self.config['bootstrap_servers']))
+
+        # Check Broker Version if not set explicitly
+        if self.config['api_version'] is None:
+            check_timeout = self.config['api_version_auto_timeout_ms'] / 1000
+            self.config['api_version'] = self.check_version(timeout=check_timeout)
 
     def _bootstrap(self, hosts):
         # Exponential backoff if bootstrap fails
@@ -152,12 +212,17 @@ class KafkaClient(object):
             time.sleep(next_at - now)
         self._last_bootstrap = time.time()
 
-        metadata_request = MetadataRequest[0]([])
+        if self.config['api_version'] is None or self.config['api_version'] < (0, 10):
+            metadata_request = MetadataRequest[0]([])
+        else:
+            metadata_request = MetadataRequest[1](None)
+
         for host, port, afi in hosts:
             log.debug("Attempting to bootstrap via node at %s:%s", host, port)
             cb = functools.partial(self._conn_state_change, 'bootstrap')
             bootstrap = BrokerConnection(host, port, afi,
                                          state_change_callback=cb,
+                                         node_id='bootstrap',
                                          **self.config)
             bootstrap.connect()
             while bootstrap.connecting():
@@ -213,6 +278,8 @@ class KafkaClient(object):
             except KeyError:
                 pass
             self._selector.register(conn._sock, selectors.EVENT_READ, conn)
+            if self._sensors:
+                self._sensors.connection_created.record()
 
             if 'bootstrap' in self._conns and node_id != 'bootstrap':
                 bootstrap = self._conns.pop('bootstrap')
@@ -229,6 +296,8 @@ class KafkaClient(object):
                 self._selector.unregister(conn._sock)
             except KeyError:
                 pass
+            if self._sensors:
+                self._sensors.connection_closed.record()
             if self._refresh_on_disconnects and not self._closed:
                 log.warning("Node %s connection failed -- refreshing metadata", node_id)
                 self.cluster.request_update()
@@ -245,6 +314,7 @@ class KafkaClient(object):
             cb = functools.partial(self._conn_state_change, node_id)
             self._conns[node_id] = BrokerConnection(host, broker.port, afi,
                                                     state_change_callback=cb,
+                                                    node_id=node_id,
                                                     **self.config)
         conn = self._conns[node_id]
         if conn.connected():
@@ -451,7 +521,14 @@ class KafkaClient(object):
 
         responses = []
         processed = set()
-        for key, events in self._selector.select(timeout):
+
+        start_select = time.time()
+        ready = self._selector.select(timeout)
+        end_select = time.time()
+        if self._sensors:
+            self._sensors.select_time.record((end_select - start_select) * 1000000000)
+
+        for key, events in ready:
             if key.fileobj is self._wake_r:
                 self._clear_wake_fd()
                 continue
@@ -470,10 +547,13 @@ class KafkaClient(object):
                 #
                 # either way, we can no longer safely use this connection
                 #
-                # Do a 1-byte read to clear the READ flag, and then close the conn
-                unexpected_data = key.fileobj.recv(1)
-                if unexpected_data:  # anything other than a 0-byte read means protocol issues
-                    log.warning('Protocol out of sync on %r, closing', conn)
+                # Do a 1-byte read to check protocol didnt get out of sync, and then close the conn
+                try:
+                    unexpected_data = key.fileobj.recv(1)
+                    if unexpected_data:  # anything other than a 0-byte read means protocol issues
+                        log.warning('Protocol out of sync on %r, closing', conn)
+                except socket.error:
+                    pass
                 conn.close()
                 continue
 
@@ -495,6 +575,9 @@ class KafkaClient(object):
                     response = conn.recv()
                     if response:
                         responses.append(response)
+
+        if self._sensors:
+            self._sensors.io_time.record((time.time() - end_select) * 1000000000)
         return responses
 
     def in_flight_request_count(self, node_id=None):
@@ -617,10 +700,17 @@ class KafkaClient(object):
 
             topics = list(self._topics)
             if self.cluster.need_all_topic_metadata:
-                topics = []
+                if self.config['api_version'] < (0, 10):
+                    topics = []
+                else:
+                    topics = None
 
             if self._can_send_request(node_id):
-                request = MetadataRequest[0](topics)
+                if self.config['api_version'] < (0, 10):
+                    api_version = 0
+                else:
+                    api_version = 1
+                request = MetadataRequest[api_version](topics)
                 log.debug("Sending metadata request %s to node %s", request, node_id)
                 future = self.send(node_id, request)
                 future.add_callback(self.cluster.update_metadata)
@@ -683,7 +773,7 @@ class KafkaClient(object):
             is down and the client enters a bootstrap backoff sleep.
             This is only possible if node_id is None.
 
-        Returns: version str, i.e. '0.10', '0.9', '0.8.2', '0.8.1', '0.8.0'
+        Returns: version tuple, i.e. (0, 10), (0, 9), (0, 8, 2), ...
 
         Raises:
             NodeNotReadyError (if node_id is provided)
@@ -721,10 +811,12 @@ class KafkaClient(object):
             raise Errors.NoBrokersAvailable()
 
     def wakeup(self):
-        if self._wake_w.send(b'x') != 1:
-            log.warning('Unable to send to wakeup socket!')
+        with self._wake_lock:
+            if self._wake_w.send(b'x') != 1:
+                log.warning('Unable to send to wakeup socket!')
 
     def _clear_wake_fd(self):
+        # reading from wake socket should only happen in a single thread
         while True:
             try:
                 self._wake_r.recv(1024)
@@ -803,3 +895,47 @@ class DelayedTaskQueue(object):
                 break
             ready_tasks.append(task)
         return ready_tasks
+
+
+class KafkaClientMetrics(object):
+    def __init__(self, metrics, metric_group_prefix, conns):
+        self.metrics = metrics
+        self.metric_group_name = metric_group_prefix + '-metrics'
+
+        self.connection_closed = metrics.sensor('connections-closed')
+        self.connection_closed.add(metrics.metric_name(
+            'connection-close-rate', self.metric_group_name,
+            'Connections closed per second in the window.'), Rate())
+        self.connection_created = metrics.sensor('connections-created')
+        self.connection_created.add(metrics.metric_name(
+            'connection-creation-rate', self.metric_group_name,
+            'New connections established per second in the window.'), Rate())
+
+        self.select_time = metrics.sensor('select-time')
+        self.select_time.add(metrics.metric_name(
+            'select-rate', self.metric_group_name,
+            'Number of times the I/O layer checked for new I/O to perform per'
+            ' second'), Rate(sampled_stat=Count()))
+        self.select_time.add(metrics.metric_name(
+            'io-wait-time-ns-avg', self.metric_group_name,
+            'The average length of time the I/O thread spent waiting for a'
+            ' socket ready for reads or writes in nanoseconds.'), Avg())
+        self.select_time.add(metrics.metric_name(
+            'io-wait-ratio', self.metric_group_name,
+            'The fraction of time the I/O thread spent waiting.'),
+            Rate(time_unit=TimeUnit.NANOSECONDS))
+
+        self.io_time = metrics.sensor('io-time')
+        self.io_time.add(metrics.metric_name(
+            'io-time-ns-avg', self.metric_group_name,
+            'The average length of time for I/O per select call in nanoseconds.'),
+            Avg())
+        self.io_time.add(metrics.metric_name(
+            'io-ratio', self.metric_group_name,
+            'The fraction of time the I/O thread spent doing I/O'),
+            Rate(time_unit=TimeUnit.NANOSECONDS))
+
+        metrics.add_metric(metrics.metric_name(
+            'connection-count', self.metric_group_name,
+            'The current number of active connections.'), AnonMeasurable(
+                lambda config, now: len(conns)))

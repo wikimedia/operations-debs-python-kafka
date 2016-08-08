@@ -1,3 +1,5 @@
+from __future__ import absolute_import
+
 from collections import namedtuple
 
 
@@ -58,7 +60,7 @@ TopicPartition = namedtuple("TopicPartition",
     ["topic", "partition"])
 
 BrokerMetadata = namedtuple("BrokerMetadata",
-    ["nodeId", "host", "port"])
+    ["nodeId", "host", "port", "rack"])
 
 PartitionMetadata = namedtuple("PartitionMetadata",
     ["topic", "partition", "leader", "replicas", "isr", "error"])

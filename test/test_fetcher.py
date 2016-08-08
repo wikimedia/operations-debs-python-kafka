@@ -15,7 +15,7 @@ from kafka.structs import TopicPartition, OffsetAndMetadata
 
 @pytest.fixture
 def client(mocker):
-    return mocker.Mock(spec=KafkaClient(bootstrap_servers=[]))
+    return mocker.Mock(spec=KafkaClient(bootstrap_servers=[], api_version=(0, 9)))
 
 
 @pytest.fixture
@@ -30,7 +30,7 @@ def fetcher(client, subscription_state):
     subscription_state.assign_from_subscribed(assignment)
     for tp in assignment:
         subscription_state.seek(tp, 0)
-    return Fetcher(client, subscription_state, Metrics(), 'test_fetcher')
+    return Fetcher(client, subscription_state, Metrics())
 
 
 def test_init_fetches(fetcher, mocker):

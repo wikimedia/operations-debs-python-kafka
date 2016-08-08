@@ -2,17 +2,18 @@ from __future__ import absolute_import
 
 import copy
 import logging
+import socket
 import time
 
-import six
+from kafka.vendor import six
 
-from kafka.client_async import KafkaClient
+from kafka.client_async import KafkaClient, selectors
 from kafka.consumer.fetcher import Fetcher
 from kafka.consumer.subscription_state import SubscriptionState
 from kafka.coordinator.consumer import ConsumerCoordinator
 from kafka.coordinator.assignors.range import RangePartitionAssignor
 from kafka.coordinator.assignors.roundrobin import RoundRobinPartitionAssignor
-from kafka.metrics import DictReporter, MetricConfig, Metrics
+from kafka.metrics import MetricConfig, Metrics
 from kafka.protocol.offset import OffsetResetStrategy
 from kafka.structs import TopicPartition
 from kafka.version import __version__
@@ -114,12 +115,15 @@ class KafkaConsumer(six.Iterator):
             rebalances. Default: 3000
         session_timeout_ms (int): The timeout used to detect failures when
             using Kafka's group managementment facilities. Default: 30000
-        send_buffer_bytes (int): The size of the TCP send buffer
-            (SO_SNDBUF) to use when sending data. Default: None (relies on
-            system defaults). The java client defaults to 131072.
         receive_buffer_bytes (int): The size of the TCP receive buffer
             (SO_RCVBUF) to use when reading data. Default: None (relies on
             system defaults). The java client defaults to 32768.
+        send_buffer_bytes (int): The size of the TCP send buffer
+            (SO_SNDBUF) to use when sending data. Default: None (relies on
+            system defaults). The java client defaults to 131072.
+        socket_options (list): List of tuple-arguments to socket.setsockopt
+            to apply to broker connection sockets. Default:
+            [(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)]
         consumer_timeout_ms (int): number of milliseconds to block during
             message iteration before raising StopIteration (i.e., ending the
             iterator). Default -1 (block forever).
@@ -139,23 +143,32 @@ class KafkaConsumer(six.Iterator):
             should verify that the certificate matches the brokers hostname.
             default: true.
         ssl_cafile (str): optional filename of ca file to use in certificate
-            veriication. default: none.
+            verification. default: none.
         ssl_certfile (str): optional filename of file in pem format containing
             the client certificate, as well as any ca certificates needed to
             establish the certificate's authenticity. default: none.
         ssl_keyfile (str): optional filename containing the client private key.
             default: none.
+        ssl_password (str): optional password to be used when loading the
+            certificate chain. default: None.
         ssl_crlfile (str): optional filename containing the CRL to check for
             certificate expiration. By default, no CRL check is done. When
             providing a file, only the leaf certificate will be checked against
             this CRL. The CRL can only be checked with Python 3.4+ or 2.7.9+.
             default: none.
-        api_version (str): specify which kafka API version to use.
-            0.9 enables full group coordination features; 0.8.2 enables
-            kafka-storage offset commits; 0.8.1 enables zookeeper-storage
-            offset commits; 0.8.0 is what is left. If set to 'auto', will
-            attempt to infer the broker version by probing various APIs.
-            Default: auto
+        api_version (tuple): specify which kafka API version to use.
+            If set to None, the client will attempt to infer the broker version
+            by probing various APIs. Default: None
+            Examples:
+                (0, 9) enables full group coordination features with automatic
+                    partition assignment and rebalancing,
+                (0, 8, 2) enables kafka-storage offset commits with manual
+                    partition assignment only,
+                (0, 8, 1) enables zookeeper-storage offset commits with manual
+                    partition assignment only,
+                (0, 8, 0) enables basic functionality but requires manual
+                    partition assignment and offset management.
+            For a full list of supported versions, see KafkaClient.API_VERSIONS
         api_version_auto_timeout_ms (int): number of milliseconds to throw a
             timeout exception from the constructor when checking the broker
             api version. Only applies if api_version set to 'auto'
@@ -164,12 +177,26 @@ class KafkaConsumer(six.Iterator):
             in classes that will be notified of new metric creation. Default: []
         metrics_num_samples (int): The number of samples maintained to compute
             metrics. Default: 2
-        metrics_sample_window_ms (int): The number of samples maintained to
-            compute metrics. Default: 30000
+        metrics_sample_window_ms (int): The maximum age in milliseconds of
+            samples used to compute metrics. Default: 30000
+        selector (selectors.BaseSelector): Provide a specific selector
+            implementation to use for I/O multiplexing.
+            Default: selectors.DefaultSelector
+        exclude_internal_topics (bool): Whether records from internal topics
+            (such as offsets) should be exposed to the consumer. If set to True
+            the only way to receive records from an internal topic is
+            subscribing to it. Requires 0.10+ Default: True
+        sasl_mechanism (str): string picking sasl mechanism when security_protocol
+            is SASL_PLAINTEXT or SASL_SSL. Currently only PLAIN is supported.
+            Default: None
+        sasl_plain_username (str): username for sasl PLAIN authentication.
+            Default: None
+        sasl_plain_password (str): password for sasl PLAIN authentication.
+            Defualt: None
 
     Note:
         Configuration parameters are described in more detail at
-        https://kafka.apache.org/090/configuration.html#newconsumerconfigs
+        https://kafka.apache.org/0100/configuration.html#newconsumerconfigs
     """
     DEFAULT_CONFIG = {
         'bootstrap_servers': 'localhost',
@@ -193,8 +220,9 @@ class KafkaConsumer(six.Iterator):
         'partition_assignment_strategy': (RangePartitionAssignor, RoundRobinPartitionAssignor),
         'heartbeat_interval_ms': 3000,
         'session_timeout_ms': 30000,
-        'send_buffer_bytes': None,
         'receive_buffer_bytes': None,
+        'send_buffer_bytes': None,
+        'socket_options': [(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)],
         'consumer_timeout_ms': -1,
         'skip_double_compressed_messages': False,
         'security_protocol': 'PLAINTEXT',
@@ -205,12 +233,18 @@ class KafkaConsumer(six.Iterator):
         'ssl_keyfile': None,
         'ssl_crlfile': None,
         'ssl_password': None,
-        'api_version': 'auto',
+        'api_version': None,
         'api_version_auto_timeout_ms': 2000,
         'connections_max_idle_ms': 9 * 60 * 1000, # not implemented yet
         'metric_reporters': [],
         'metrics_num_samples': 2,
         'metrics_sample_window_ms': 30000,
+        'metric_group_prefix': 'consumer',
+        'selector': selectors.DefaultSelector,
+        'exclude_internal_topics': True,
+        'sasl_mechanism': None,
+        'sasl_plain_username': None,
+        'sasl_plain_password': None,
     }
 
     def __init__(self, *topics, **configs):
@@ -222,7 +256,7 @@ class KafkaConsumer(six.Iterator):
         # Only check for extra config keys in top-level class
         assert not configs, 'Unrecognized configs: %s' % configs
 
-        deprecated = {'smallest': 'earliest', 'largest': 'latest' }
+        deprecated = {'smallest': 'earliest', 'largest': 'latest'}
         if self.config['auto_offset_reset'] in deprecated:
             new_config = deprecated[self.config['auto_offset_reset']]
             log.warning('use auto_offset_reset=%s (%s is deprecated)',
@@ -234,27 +268,30 @@ class KafkaConsumer(six.Iterator):
                                      time_window_ms=self.config['metrics_sample_window_ms'],
                                      tags=metrics_tags)
         reporters = [reporter() for reporter in self.config['metric_reporters']]
-        reporters.append(DictReporter('kafka.consumer'))
         self._metrics = Metrics(metric_config, reporters)
-        metric_group_prefix = 'consumer'
         # TODO _metrics likely needs to be passed to KafkaClient, etc.
 
-        self._client = KafkaClient(**self.config)
+        # api_version was previously a str. accept old format for now
+        if isinstance(self.config['api_version'], str):
+            str_version = self.config['api_version']
+            if str_version == 'auto':
+                self.config['api_version'] = None
+            else:
+                self.config['api_version'] = tuple(map(int, str_version.split('.')))
+            log.warning('use api_version=%s [tuple] -- "%s" as str is deprecated',
+                        str(self.config['api_version']), str_version)
 
-        # Check Broker Version if not set explicitly
-        if self.config['api_version'] == 'auto':
-            self.config['api_version'] = self._client.check_version(timeout=(self.config['api_version_auto_timeout_ms']/1000))
-        assert self.config['api_version'] in ('0.10', '0.9', '0.8.2', '0.8.1', '0.8.0'), 'Unrecognized api version'
+        self._client = KafkaClient(metrics=self._metrics, **self.config)
 
-        # Convert api_version config to tuple for easy comparisons
-        self.config['api_version'] = tuple(
-            map(int, self.config['api_version'].split('.')))
+        # Get auto-discovered version from client if necessary
+        if self.config['api_version'] is None:
+            self.config['api_version'] = self._client.config['api_version']
 
         self._subscription = SubscriptionState(self.config['auto_offset_reset'])
         self._fetcher = Fetcher(
-            self._client, self._subscription, self._metrics, metric_group_prefix, **self.config)
+            self._client, self._subscription, self._metrics, **self.config)
         self._coordinator = ConsumerCoordinator(
-            self._client, self._subscription, self._metrics, metric_group_prefix,
+            self._client, self._subscription, self._metrics,
             assignors=self.config['partition_assignment_strategy'],
             **self.config)
         self._closed = False
@@ -747,6 +784,21 @@ class KafkaConsumer(six.Iterator):
         self._client.cluster.need_all_topic_metadata = False
         self._client.set_topics([])
         log.debug("Unsubscribed all topics or patterns and assigned partitions")
+
+    def metrics(self, raw=False):
+        """Warning: this is an unstable interface.
+        It may change in future releases without warning"""
+        if raw:
+            return self._metrics.metrics
+
+        metrics = {}
+        for k, v in self._metrics.metrics.items():
+            if k.group not in metrics:
+                metrics[k.group] = {}
+            if k.name not in metrics[k.group]:
+                metrics[k.group][k.name] = {}
+            metrics[k.group][k.name] = v.value()
+        return metrics
 
     def _use_consumer_group(self):
         """Return True iff this consumer can/should join a broker-coordinated group."""

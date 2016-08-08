@@ -6,7 +6,7 @@ import logging
 import time
 import weakref
 
-import six
+from kafka.vendor import six
 
 from .base import BaseCoordinator
 from .assignors.range import RangePartitionAssignor
@@ -36,10 +36,11 @@ class ConsumerCoordinator(BaseCoordinator):
         'heartbeat_interval_ms': 3000,
         'retry_backoff_ms': 100,
         'api_version': (0, 9),
+        'exclude_internal_topics': True,
+        'metric_group_prefix': 'consumer'
     }
 
-    def __init__(self, client, subscription, metrics, metric_group_prefix,
-                 **configs):
+    def __init__(self, client, subscription, metrics, **configs):
         """Initialize the coordination manager.
 
         Keyword Arguments:
@@ -70,8 +71,13 @@ class ConsumerCoordinator(BaseCoordinator):
                 using Kafka's group managementment facilities. Default: 30000
             retry_backoff_ms (int): Milliseconds to backoff when retrying on
                 errors. Default: 100.
+            exclude_internal_topics (bool): Whether records from internal topics
+                (such as offsets) should be exposed to the consumer. If set to
+                True the only way to receive records from an internal topic is
+                subscribing to it. Requires 0.10+. Default: True
         """
-        super(ConsumerCoordinator, self).__init__(client, **configs)
+        super(ConsumerCoordinator, self).__init__(client, metrics, **configs)
+
         self.config = copy.copy(self.DEFAULT_CONFIG)
         for key in self.config:
             if key in configs:
@@ -81,7 +87,8 @@ class ConsumerCoordinator(BaseCoordinator):
             assert self.config['assignors'], 'Coordinator requires assignors'
 
         self._subscription = subscription
-        self._partitions_per_topic = {}
+        self._metadata_snapshot = {}
+        self._assignment_snapshot = None
         self._cluster = client.cluster
         self._cluster.request_update()
         self._cluster.add_listener(WeakMethod(self._handle_metadata_update))
@@ -99,13 +106,12 @@ class ConsumerCoordinator(BaseCoordinator):
             else:
                 interval = self.config['auto_commit_interval_ms'] / 1000.0
                 self._auto_commit_task = AutoCommitTask(weakref.proxy(self), interval)
+                self._auto_commit_task.reschedule()
 
-        self._sensors = ConsumerCoordinatorMetrics(metrics, metric_group_prefix,
-                                                   self._subscription)
+        self.consumer_sensors = ConsumerCoordinatorMetrics(
+            metrics, self.config['metric_group_prefix'], self._subscription)
 
     def __del__(self):
-        if hasattr(self, '_auto_commit_task') and self._auto_commit_task:
-            self._auto_commit_task.disable()
         if hasattr(self, '_cluster') and self._cluster:
             self._cluster.remove_listener(WeakMethod(self._handle_metadata_update))
 
@@ -125,13 +131,12 @@ class ConsumerCoordinator(BaseCoordinator):
 
     def _handle_metadata_update(self, cluster):
         # if we encounter any unauthorized topics, raise an exception
-        # TODO
-        #if self._cluster.unauthorized_topics:
-        #    raise TopicAuthorizationError(self._cluster.unauthorized_topics)
+        if cluster.unauthorized_topics:
+            raise Errors.TopicAuthorizationFailedError(cluster.unauthorized_topics)
 
         if self._subscription.subscribed_pattern:
             topics = []
-            for topic in cluster.topics():
+            for topic in cluster.topics(self.config['exclude_internal_topics']):
                 if self._subscription.subscribed_pattern.match(topic):
                     topics.append(topic)
 
@@ -140,7 +145,7 @@ class ConsumerCoordinator(BaseCoordinator):
 
         # check if there are any changes to the metadata which should trigger
         # a rebalance
-        if self._subscription_metadata_changed():
+        if self._subscription_metadata_changed(cluster):
 
             if (self.config['api_version'] >= (0, 9)
                 and self.config['group_id'] is not None):
@@ -153,20 +158,20 @@ class ConsumerCoordinator(BaseCoordinator):
                 self._subscription.assign_from_subscribed([
                     TopicPartition(topic, partition)
                     for topic in self._subscription.subscription
-                    for partition in self._partitions_per_topic[topic]
+                    for partition in self._metadata_snapshot[topic]
                 ])
 
-    def _subscription_metadata_changed(self):
+    def _subscription_metadata_changed(self, cluster):
         if not self._subscription.partitions_auto_assigned():
             return False
 
-        old_partitions_per_topic = self._partitions_per_topic
-        self._partitions_per_topic = {}
+        metadata_snapshot = {}
         for topic in self._subscription.group_subscription():
-            partitions = self._cluster.partitions_for_topic(topic) or []
-            self._partitions_per_topic[topic] = set(partitions)
+            partitions = cluster.partitions_for_topic(topic) or []
+            metadata_snapshot[topic] = set(partitions)
 
-        if self._partitions_per_topic != old_partitions_per_topic:
+        if self._metadata_snapshot != metadata_snapshot:
+            self._metadata_snapshot = metadata_snapshot
             return True
         return False
 
@@ -178,8 +183,15 @@ class ConsumerCoordinator(BaseCoordinator):
 
     def _on_join_complete(self, generation, member_id, protocol,
                           member_assignment_bytes):
+        # if we were the assignor, then we need to make sure that there have
+        # been no metadata updates since the rebalance begin. Otherwise, we
+        # won't rebalance again until the next metadata change
+        if self._assignment_snapshot and self._assignment_snapshot != self._metadata_snapshot:
+            self._subscription.mark_for_reassignment()
+            return
+
         assignor = self._lookup_assignor(protocol)
-        assert assignor, 'invalid assignment protocol: %s' % protocol
+        assert assignor, 'Coordinator selected invalid assignment protocol: %s' % protocol
 
         assignment = ConsumerProtocol.ASSIGNMENT.decode(member_assignment_bytes)
 
@@ -193,9 +205,9 @@ class ConsumerCoordinator(BaseCoordinator):
         # based on the received assignment
         assignor.on_assignment(assignment)
 
-        # restart the autocommit task if needed
+        # reschedule the auto commit starting from now
         if self._auto_commit_task:
-            self._auto_commit_task.enable()
+            self._auto_commit_task.reschedule()
 
         assigned = set(self._subscription.assigned_partitions())
         log.info("Setting newly assigned partitions %s for group %s",
@@ -229,6 +241,11 @@ class ConsumerCoordinator(BaseCoordinator):
         self._subscription.group_subscribe(all_subscribed_topics)
         self._client.set_topics(self._subscription.group_subscription())
 
+        # keep track of the metadata used for assignment so that we can check
+        # after rebalance completion whether anything has changed
+        self._cluster.request_update()
+        self._assignment_snapshot = self._metadata_snapshot
+
         log.debug("Performing assignment for group %s using strategy %s"
                   " with subscriptions %s", self.group_id, assignor.name,
                   member_metadata)
@@ -258,6 +275,7 @@ class ConsumerCoordinator(BaseCoordinator):
                               " for group %s failed on_partitions_revoked",
                               self._subscription.listener, self.group_id)
 
+        self._assignment_snapshot = None
         self._subscription.mark_for_reassignment()
 
     def need_rejoin(self):
@@ -293,8 +311,7 @@ class ConsumerCoordinator(BaseCoordinator):
             return {}
 
         while True:
-            if self.config['api_version'] >= (0, 8, 2):
-                self.ensure_coordinator_known()
+            self.ensure_coordinator_known()
 
             # contact coordinator to fetch committed offsets
             future = self._send_offset_fetch_request(partitions)
@@ -356,8 +373,7 @@ class ConsumerCoordinator(BaseCoordinator):
             return
 
         while True:
-            if self.config['api_version'] >= (0, 8, 2):
-                self.ensure_coordinator_known()
+            self.ensure_coordinator_known()
 
             future = self._send_offset_commit_request(offsets)
             self._client.poll(future=future)
@@ -373,10 +389,6 @@ class ConsumerCoordinator(BaseCoordinator):
     def _maybe_auto_commit_offsets_sync(self):
         if self._auto_commit_task is None:
             return
-
-        # disable periodic commits prior to committing synchronously. note that they will
-        # be re-enabled after a rebalance completes
-        self._auto_commit_task.disable()
 
         try:
             self.commit_offsets_sync(self._subscription.all_consumed_offsets())
@@ -415,14 +427,10 @@ class ConsumerCoordinator(BaseCoordinator):
             log.debug('No offsets to commit')
             return Future().success(True)
 
-        if self.config['api_version'] >= (0, 8, 2):
-            if self.coordinator_unknown():
-                return Future().failure(Errors.GroupCoordinatorNotAvailableError)
-            node_id = self.coordinator_id
-        else:
-            node_id = self._client.least_loaded_node()
-            if node_id is None:
-                return Future().failure(Errors.NoBrokersAvailable)
+        elif self.coordinator_unknown():
+            return Future().failure(Errors.GroupCoordinatorNotAvailableError)
+
+        node_id = self.coordinator_id
 
         # create the offset commit request
         offset_data = collections.defaultdict(dict)
@@ -478,7 +486,7 @@ class ConsumerCoordinator(BaseCoordinator):
 
     def _handle_offset_commit_response(self, offsets, future, send_time, response):
         # TODO look at adding request_latency_ms to response (like java kafka)
-        self._sensors.commit_latency.record((time.time() - send_time) * 1000)
+        self.consumer_sensors.commit_latency.record((time.time() - send_time) * 1000)
         unauthorized_topics = set()
 
         for topic, partitions in response.topics:
@@ -571,14 +579,10 @@ class ConsumerCoordinator(BaseCoordinator):
         if not partitions:
             return Future().success({})
 
-        if self.config['api_version'] >= (0, 8, 2):
-            if self.coordinator_unknown():
-                return Future().failure(Errors.GroupCoordinatorNotAvailableError)
-            node_id = self.coordinator_id
-        else:
-            node_id = self._client.least_loaded_node()
-            if node_id is None:
-                return Future().failure(Errors.NoBrokersAvailable)
+        elif self.coordinator_unknown():
+            return Future().failure(Errors.GroupCoordinatorNotAvailableError)
+
+        node_id = self.coordinator_id
 
         # Verify node is ready
         if not self._client.ready(node_id):
@@ -658,47 +662,25 @@ class AutoCommitTask(object):
         self._coordinator = coordinator
         self._client = coordinator._client
         self._interval = interval
-        self._enabled = False
-        self._request_in_flight = False
 
-    def enable(self):
-        if self._enabled:
-            log.warning("AutoCommitTask is already enabled")
-            return
-
-        self._enabled = True
-        if not self._request_in_flight:
-            self._client.schedule(self, time.time() + self._interval)
-
-    def disable(self):
-        self._enabled = False
-        try:
-            self._client.unschedule(self)
-        except KeyError:
-            pass
-
-    def _reschedule(self, at):
-        assert self._enabled, 'AutoCommitTask not enabled'
+    def reschedule(self, at=None):
+        if at is None:
+            at = time.time() + self._interval
         self._client.schedule(self, at)
 
     def __call__(self):
-        if not self._enabled:
-            return
-
         if self._coordinator.coordinator_unknown():
             log.debug("Cannot auto-commit offsets for group %s because the"
                       " coordinator is unknown", self._coordinator.group_id)
             backoff = self._coordinator.config['retry_backoff_ms'] / 1000.0
-            self._client.schedule(self, time.time() + backoff)
+            self.reschedule(time.time() + backoff)
             return
 
-        self._request_in_flight = True
         self._coordinator.commit_offsets_async(
             self._coordinator._subscription.all_consumed_offsets(),
             self._handle_commit_response)
 
     def _handle_commit_response(self, offsets, result):
-        self._request_in_flight = False
         if result is True:
             log.debug("Successfully auto-committed offsets for group %s",
                       self._coordinator.group_id)
@@ -717,10 +699,7 @@ class AutoCommitTask(object):
                         self._coordinator.group_id, result)
             next_at = time.time() + self._interval
 
-        if not self._enabled:
-            log.warning("Skipping auto-commit reschedule -- it is disabled")
-            return
-        self._reschedule(next_at)
+        self.reschedule(next_at)
 
 
 class ConsumerCoordinatorMetrics(object):

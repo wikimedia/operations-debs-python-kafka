@@ -1,3 +1,5 @@
+from __future__ import absolute_import
+
 import inspect
 import sys
 
@@ -6,6 +8,12 @@ class KafkaError(RuntimeError):
     retriable = False
     # whether metadata should be refreshed on error
     invalid_metadata = False
+
+    def __str__(self):
+        if not self.args:
+            return self.__class__.__name__
+        return '{0}: {1}'.format(self.__class__.__name__,
+                               super(KafkaError, self).__str__())
 
 
 class IllegalStateError(KafkaError):
@@ -50,13 +58,25 @@ class CommitFailedError(KafkaError):
     pass
 
 
+class AuthenticationMethodNotSupported(KafkaError):
+    pass
+
+
+class AuthenticationFailedError(KafkaError):
+    retriable = False
+
+
 class BrokerResponseError(KafkaError):
     errno = None
     message = None
     description = None
 
     def __str__(self):
-        return '%s - %s - %s' % (self.__class__.__name__, self.errno, self.description)
+        """Add errno to standard KafkaError str"""
+        return '[Error {0}] {1}: {2}'.format(
+            self.errno,
+            self.__class__.__name__,
+            super(KafkaError, self).__str__()) # pylint: disable=bad-super-call
 
 
 class NoError(BrokerResponseError):
@@ -314,6 +334,18 @@ class InvalidTimestampError(BrokerResponseError):
     errno = 32
     message = 'INVALID_TIMESTAMP'
     description = ('The timestamp of the message is out of acceptable range.')
+
+
+class UnsupportedSaslMechanismError(BrokerResponseError):
+    errno = 33
+    message = 'UNSUPPORTED_SASL_MECHANISM'
+    description = ('The broker does not support the requested SASL mechanism.')
+
+
+class IllegalSaslStateError(BrokerResponseError):
+    errno = 34
+    message = 'ILLEGAL_SASL_STATE'
+    description = ('Request is not valid given the current SASL state.')
 
 
 class KafkaUnavailableError(KafkaError):

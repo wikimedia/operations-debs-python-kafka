@@ -29,21 +29,30 @@ class FutureProduceResult(Future):
 
 
 class FutureRecordMetadata(Future):
-    def __init__(self, produce_future, relative_offset, timestamp_ms):
+    def __init__(self, produce_future, relative_offset, timestamp_ms, checksum, serialized_key_size, serialized_value_size):
         super(FutureRecordMetadata, self).__init__()
         self._produce_future = produce_future
-        self.relative_offset = relative_offset
-        self.timestamp_ms = timestamp_ms
+        # packing args as a tuple is a minor speed optimization
+        self.args = (relative_offset, timestamp_ms, checksum, serialized_key_size, serialized_value_size)
         produce_future.add_callback(self._produce_success)
         produce_future.add_errback(self.failure)
 
     def _produce_success(self, offset_and_timestamp):
-        base_offset, timestamp_ms = offset_and_timestamp
-        if timestamp_ms is None:
-            timestamp_ms = self.timestamp_ms
-        self.success(RecordMetadata(self._produce_future.topic_partition,
-                                    base_offset, timestamp_ms,
-                                    self.relative_offset))
+        offset, produce_timestamp_ms = offset_and_timestamp
+
+        # Unpacking from args tuple is minor speed optimization
+        (relative_offset, timestamp_ms, checksum,
+         serialized_key_size, serialized_value_size) = self.args
+
+        if produce_timestamp_ms is not None:
+            timestamp_ms = produce_timestamp_ms
+        if offset != -1 and relative_offset is not None:
+            offset += relative_offset
+        tp = self._produce_future.topic_partition
+        metadata = RecordMetadata(tp[0], tp[1], tp, offset, timestamp_ms,
+                                  checksum, serialized_key_size,
+                                  serialized_value_size)
+        self.success(metadata)
 
     def get(self, timeout=None):
         if not self.is_done and not self._produce_future.wait(timeout):
@@ -55,18 +64,6 @@ class FutureRecordMetadata(Future):
         return self.value
 
 
-class RecordMetadata(collections.namedtuple(
-    'RecordMetadata', 'topic partition topic_partition offset timestamp')):
-    def __new__(cls, tp, base_offset, timestamp, relative_offset=None):
-        offset = base_offset
-        if relative_offset is not None and base_offset != -1:
-            offset += relative_offset
-        return super(RecordMetadata, cls).__new__(cls, tp.topic, tp.partition,
-                                                  tp, offset, timestamp)
-
-    def __str__(self):
-        return 'RecordMetadata(topic=%s, partition=%s, offset=%s)' % (
-            self.topic, self.partition, self.offset)
-
-    def __repr__(self):
-        return str(self)
+RecordMetadata = collections.namedtuple(
+    'RecordMetadata', ['topic', 'partition', 'topic_partition', 'offset', 'timestamp',
+                       'checksum', 'serialized_key_size', 'serialized_value_size'])

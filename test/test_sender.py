@@ -7,18 +7,19 @@ import pytest
 
 from kafka.client_async import KafkaClient
 from kafka.cluster import ClusterMetadata
-from kafka.producer.buffer import MessageSetBuffer
-from kafka.producer.sender import Sender
-from kafka.producer.record_accumulator import RecordAccumulator, RecordBatch
 import kafka.errors as Errors
 from kafka.future import Future
+from kafka.metrics import Metrics
+from kafka.producer.buffer import MessageSetBuffer
 from kafka.protocol.produce import ProduceRequest
+from kafka.producer.record_accumulator import RecordAccumulator, RecordBatch
+from kafka.producer.sender import Sender
 from kafka.structs import TopicPartition, OffsetAndMetadata
 
 
 @pytest.fixture
 def client(mocker):
-    _cli = mocker.Mock(spec=KafkaClient(bootstrap_servers=[]))
+    _cli = mocker.Mock(spec=KafkaClient(bootstrap_servers=[], api_version=(0, 9)))
     _cli.cluster = mocker.Mock(spec=ClusterMetadata())
     return _cli
 
@@ -29,8 +30,13 @@ def accumulator():
 
 
 @pytest.fixture
-def sender(client, accumulator):
-    return Sender(client, client.cluster, accumulator)
+def metrics():
+    return Metrics()
+
+
+@pytest.fixture
+def sender(client, accumulator, metrics):
+    return Sender(client, client.cluster, accumulator, metrics)
 
 
 @pytest.mark.parametrize(("api_version", "produce_version"), [

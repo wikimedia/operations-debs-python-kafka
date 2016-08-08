@@ -1,3 +1,5 @@
+from __future__ import absolute_import
+
 from .message import MessageSet
 from .struct import Struct
 from .types import Int16, Int32, Int64, String, Array, Schema
@@ -41,7 +43,7 @@ class ProduceResponse_v2(Struct):
                 ('error_code', Int16),
                 ('offset', Int64),
                 ('timestamp', Int64))))),
-        ('thottle_time_ms', Int32)
+        ('throttle_time_ms', Int32)
     )
 
 

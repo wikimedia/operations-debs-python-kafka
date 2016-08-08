@@ -6,7 +6,7 @@ import logging
 import random
 import time
 
-import six
+from kafka.vendor import six
 
 import kafka.errors as Errors
 from kafka.future import Future
@@ -20,7 +20,8 @@ log = logging.getLogger(__name__)
 
 
 ConsumerRecord = collections.namedtuple("ConsumerRecord",
-    ["topic", "partition", "offset", "timestamp", "timestamp_type", "key", "value"])
+    ["topic", "partition", "offset", "timestamp", "timestamp_type",
+     "key", "value", "checksum", "serialized_key_size", "serialized_value_size"])
 
 
 class NoOffsetForPartitionError(Errors.KafkaError):
@@ -41,11 +42,11 @@ class Fetcher(six.Iterator):
         'check_crcs': True,
         'skip_double_compressed_messages': False,
         'iterator_refetch_records': 1, # undocumented -- interface may change
+        'metric_group_prefix': 'consumer',
         'api_version': (0, 8, 0),
     }
 
-    def __init__(self, client, subscriptions, metrics, metric_group_prefix,
-                 **configs):
+    def __init__(self, client, subscriptions, metrics, **configs):
         """Initialize a Kafka Message Fetcher.
 
         Keyword Arguments:
@@ -93,7 +94,7 @@ class Fetcher(six.Iterator):
         self._record_too_large_partitions = dict() # {topic_partition: offset}
         self._iterator = None
         self._fetch_futures = collections.deque()
-        self._sensors = FetchManagerMetrics(metrics, metric_group_prefix)
+        self._sensors = FetchManagerMetrics(metrics, self.config['metric_group_prefix'])
 
     def init_fetches(self):
         """Send FetchRequests asynchronously for all assigned partitions.
@@ -400,7 +401,7 @@ class Fetcher(six.Iterator):
                                 inner_timestamp = msg.timestamp
 
                             else:
-                                raise ValueError('Unknown timestamp type: {}'.format(msg.timestamp_type))
+                                raise ValueError('Unknown timestamp type: {0}'.format(msg.timestamp_type))
                         else:
                             inner_timestamp = msg.timestamp
 
@@ -410,13 +411,17 @@ class Fetcher(six.Iterator):
                         key, value = self._deserialize(inner_msg)
                         yield ConsumerRecord(tp.topic, tp.partition, inner_offset,
                                              inner_timestamp, msg.timestamp_type,
-                                             key, value)
+                                             key, value, inner_msg.crc,
+                                             len(inner_msg.key) if inner_msg.key is not None else -1,
+                                             len(inner_msg.value) if inner_msg.value is not None else -1)
 
                 else:
                     key, value = self._deserialize(msg)
                     yield ConsumerRecord(tp.topic, tp.partition, offset,
                                          msg.timestamp, msg.timestamp_type,
-                                         key, value)
+                                         key, value, msg.crc,
+                                         len(msg.key) if msg.key is not None else -1,
+                                         len(msg.value) if msg.value is not None else -1)
 
         # If unpacking raises StopIteration, it is erroneously
         # caught by the generator. We want all exceptions to be raised
@@ -678,7 +683,9 @@ class Fetcher(six.Iterator):
                     self._subscriptions.assignment[tp].highwater = highwater
 
                     # we are interested in this fetch only if the beginning
-                    # offset matches the current consumed position
+                    # offset (of the *request*) matches the current consumed position
+                    # Note that the *response* may return a messageset that starts
+                    # earlier (e.g., compressed messages) or later (e.g., compacted topic)
                     fetch_offset = fetch_offsets[tp]
                     position = self._subscriptions.assignment[tp].position
                     if position is None or position != fetch_offset:
@@ -729,6 +736,8 @@ class Fetcher(six.Iterator):
                 else:
                     raise error_type('Unexpected error while fetching data')
 
+        # Because we are currently decompressing messages lazily, the sensors here
+        # will get compressed bytes / message set stats when compression is enabled
         self._sensors.bytes_fetched.record(total_bytes)
         self._sensors.records_fetched.record(total_count)
         if response.API_VERSION >= 1:
@@ -774,12 +783,12 @@ class FetchManagerMetrics(object):
             'The maximum throttle time in ms'), Max())
 
     def record_topic_fetch_metrics(self, topic, num_bytes, num_records):
-        metric_tags = {'topic': topic.replace('.', '_')}
-
         # record bytes fetched
         name = '.'.join(['topic', topic, 'bytes-fetched'])
         bytes_fetched = self.metrics.get_sensor(name)
         if not bytes_fetched:
+            metric_tags = {'topic': topic.replace('.', '_')}
+
             bytes_fetched = self.metrics.sensor(name)
             bytes_fetched.add(self.metrics.metric_name('fetch-size-avg',
                     self.group_name,
@@ -799,6 +808,8 @@ class FetchManagerMetrics(object):
         name = '.'.join(['topic', topic, 'records-fetched'])
         records_fetched = self.metrics.get_sensor(name)
         if not records_fetched:
+            metric_tags = {'topic': topic.replace('.', '_')}
+
             records_fetched = self.metrics.sensor(name)
             records_fetched.add(self.metrics.metric_name('records-per-request-avg',
                     self.group_name,

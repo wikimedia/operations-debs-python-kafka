@@ -1,3 +1,5 @@
+from __future__ import absolute_import
+
 import logging
 import os
 import re
@@ -72,7 +74,13 @@ class SpawnedService(threading.Thread):
     def run(self):
         self._spawn()
         while True:
-            (rds, _, _) = select.select([self.child.stdout, self.child.stderr], [], [], 1)
+            try:
+                (rds, _, _) = select.select([self.child.stdout, self.child.stderr], [], [], 1)
+            except select.error as ex:
+                if ex.args[0] == 4:
+                    continue
+                else:
+                    raise
 
             if self.child.stdout in rds:
                 line = self.child.stdout.readline()

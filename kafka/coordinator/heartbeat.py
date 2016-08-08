@@ -1,3 +1,5 @@
+from __future__ import absolute_import
+
 import copy
 import time
 
@@ -20,8 +22,8 @@ class Heartbeat(object):
 
         self.interval = self.config['heartbeat_interval_ms'] / 1000.0
         self.timeout = self.config['session_timeout_ms'] / 1000.0
-        self.last_send = 0
-        self.last_receive = 0
+        self.last_send = -1 * float('inf')
+        self.last_receive = -1 * float('inf')
         self.last_reset = time.time()
 
     def sent_heartbeat(self):

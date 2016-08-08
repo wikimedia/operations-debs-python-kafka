@@ -1,3 +1,5 @@
+from __future__ import absolute_import
+
 import collections
 import copy
 import functools
@@ -5,7 +7,7 @@ import logging
 import random
 import time
 
-import six
+from kafka.vendor import six
 
 import kafka.errors
 from kafka.errors import (UnknownError, ConnectionError, FailedPayloadsError,
@@ -15,7 +17,7 @@ from kafka.errors import (UnknownError, ConnectionError, FailedPayloadsError,
 from kafka.structs import TopicPartition, BrokerMetadata
 
 from kafka.conn import (
-    collect_hosts, BrokerConnection, DEFAULT_SOCKET_TIMEOUT_SECONDS,
+    collect_hosts, BrokerConnection,
     ConnectionStates, get_ip_port_afi)
 from kafka.protocol import KafkaProtocol
 
@@ -32,6 +34,7 @@ log = logging.getLogger(__name__)
 class SimpleClient(object):
 
     CLIENT_ID = b'kafka-python'
+    DEFAULT_SOCKET_TIMEOUT_SECONDS = 120
 
     # NOTE: The timeout given to the client should always be greater than the
     # one passed to SimpleConsumer.get_message(), otherwise you can get a
@@ -137,7 +140,7 @@ class SimpleClient(object):
         kafka.errors.check_error(resp)
 
         # Otherwise return the BrokerMetadata
-        return BrokerMetadata(resp.nodeId, resp.host, resp.port)
+        return BrokerMetadata(resp.nodeId, resp.host, resp.port, None)
 
     def _next_id(self):
         """Generate a new correlation id"""
@@ -525,7 +528,7 @@ class SimpleClient(object):
         log.debug('Updating broker metadata: %s', resp.brokers)
         log.debug('Updating topic metadata: %s', [topic for _, topic, _ in resp.topics])
 
-        self.brokers = dict([(nodeId, BrokerMetadata(nodeId, host, port))
+        self.brokers = dict([(nodeId, BrokerMetadata(nodeId, host, port, None))
                              for nodeId, host, port in resp.brokers])
 
         for error, topic, partitions in resp.topics:
@@ -577,7 +580,7 @@ class SimpleClient(object):
                 # (not sure how this could happen. server could be in bad state)
                 else:
                     self.topics_to_brokers[topic_part] = BrokerMetadata(
-                        leader, None, None
+                        leader, None, None, None
                     )
 
     def send_metadata_request(self, payloads=[], fail_on_error=True,

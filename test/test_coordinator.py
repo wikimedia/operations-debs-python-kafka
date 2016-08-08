@@ -24,25 +24,24 @@ from kafka.util import WeakMethod
 
 
 @pytest.fixture
-def coordinator(conn):
-    return ConsumerCoordinator(KafkaClient(), SubscriptionState(), Metrics(),
-                               'consumer')
+def client(conn):
+    return KafkaClient(api_version=(0, 9))
+
+@pytest.fixture
+def coordinator(client):
+    return ConsumerCoordinator(client, SubscriptionState(), Metrics())
 
 
-def test_init(conn):
-    cli = KafkaClient()
-    coordinator = ConsumerCoordinator(cli, SubscriptionState(), Metrics(),
-                                      'consumer')
-
+def test_init(client, coordinator):
     # metadata update on init 
-    assert cli.cluster._need_update is True
-    assert WeakMethod(coordinator._handle_metadata_update) in cli.cluster._listeners
+    assert client.cluster._need_update is True
+    assert WeakMethod(coordinator._handle_metadata_update) in client.cluster._listeners
 
 
 @pytest.mark.parametrize("api_version", [(0, 8, 0), (0, 8, 1), (0, 8, 2), (0, 9)])
-def test_autocommit_enable_api_version(conn, api_version):
-    coordinator = ConsumerCoordinator(KafkaClient(), SubscriptionState(),
-                                      Metrics(), 'consumer',
+def test_autocommit_enable_api_version(client, api_version):
+    coordinator = ConsumerCoordinator(client, SubscriptionState(),
+                                      Metrics(),
                                       enable_auto_commit=True,
                                       group_id='foobar',
                                       api_version=api_version)
@@ -80,12 +79,12 @@ def test_group_protocols(coordinator):
     ]
 
 
-@pytest.mark.parametrize('api_version', [(0, 8), (0, 8, 1), (0, 8, 2), (0, 9)])
+@pytest.mark.parametrize('api_version', [(0, 8, 0), (0, 8, 1), (0, 8, 2), (0, 9)])
 def test_pattern_subscription(coordinator, api_version):
     coordinator.config['api_version'] = api_version
     coordinator._subscription.subscribe(pattern='foo')
     assert coordinator._subscription.subscription == set([])
-    assert coordinator._subscription_metadata_changed() is False
+    assert coordinator._subscription_metadata_changed({}) is False
     assert coordinator._subscription.needs_partition_assignment is False
 
     cluster = coordinator._client.cluster
@@ -344,7 +343,9 @@ def test_commit_offsets_sync(mocker, coordinator, offsets):
 
 @pytest.mark.parametrize(
     'api_version,group_id,enable,error,has_auto_commit,commit_offsets,warn,exc', [
-        ((0, 8), 'foobar', True, None, False, False, True, False),
+        ((0, 8, 0), 'foobar', True, None, False, False, True, False),
+        ((0, 8, 1), 'foobar', True, None, True, True, False, False),
+        ((0, 8, 2), 'foobar', True, None, True, True, False, False),
         ((0, 9), 'foobar', False, None, False, False, False, False),
         ((0, 9), 'foobar', True, Errors.UnknownMemberIdError(), True, True, True, False),
         ((0, 9), 'foobar', True, Errors.IllegalGenerationError(), True, True, True, False),
@@ -358,8 +359,9 @@ def test_maybe_auto_commit_offsets_sync(mocker, api_version, group_id, enable,
                                         warn, exc):
     mock_warn = mocker.patch('kafka.coordinator.consumer.log.warning')
     mock_exc = mocker.patch('kafka.coordinator.consumer.log.exception')
-    coordinator = ConsumerCoordinator(KafkaClient(), SubscriptionState(),
-                                      Metrics(), 'consumer',
+    client = KafkaClient(api_version=api_version)
+    coordinator = ConsumerCoordinator(client, SubscriptionState(),
+                                      Metrics(),
                                       api_version=api_version,
                                       enable_auto_commit=enable,
                                       group_id=group_id)
@@ -367,8 +369,6 @@ def test_maybe_auto_commit_offsets_sync(mocker, api_version, group_id, enable,
                                       side_effect=error)
     if has_auto_commit:
         assert coordinator._auto_commit_task is not None
-        coordinator._auto_commit_task.enable()
-        assert coordinator._auto_commit_task._enabled is True
     else:
         assert coordinator._auto_commit_task is None
 
@@ -376,7 +376,6 @@ def test_maybe_auto_commit_offsets_sync(mocker, api_version, group_id, enable,
 
     if has_auto_commit:
         assert coordinator._auto_commit_task is not None
-        assert coordinator._auto_commit_task._enabled is False
 
     assert commit_sync.call_count == (1 if commit_offsets else 0)
     assert mock_warn.call_count == (1 if warn else 0)
@@ -425,8 +424,7 @@ def test_send_offset_commit_request_fail(patched_coord, offsets):
     ((0, 9), OffsetCommitRequest[2])])
 def test_send_offset_commit_request_versions(patched_coord, offsets,
                                              api_version, req_type):
-    # assuming fixture sets coordinator=0, least_loaded_node=1
-    expect_node = 0 if api_version >= (0, 8, 2) else 1
+    expect_node = 0
     patched_coord.config['api_version'] = api_version
 
     patched_coord._send_offset_commit_request(offsets)
@@ -522,7 +520,7 @@ def test_send_offset_fetch_request_fail(patched_coord, partitions):
 def test_send_offset_fetch_request_versions(patched_coord, partitions,
                                             api_version, req_type):
     # assuming fixture sets coordinator=0, least_loaded_node=1
-    expect_node = 0 if api_version >= (0, 8, 2) else 1
+    expect_node = 0
     patched_coord.config['api_version'] = api_version
 
     patched_coord._send_offset_fetch_request(partitions)

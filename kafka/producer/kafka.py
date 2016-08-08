@@ -3,12 +3,14 @@ from __future__ import absolute_import
 import atexit
 import copy
 import logging
+import socket
 import threading
 import time
 import weakref
 
 from .. import errors as Errors
-from ..client_async import KafkaClient
+from ..client_async import KafkaClient, selectors
+from ..metrics import MetricConfig, Metrics
 from ..partitioner.default import DefaultPartitioner
 from ..protocol.message import Message, MessageSet
 from ..structs import TopicPartition
@@ -187,6 +189,9 @@ class KafkaProducer(object):
         send_buffer_bytes (int): The size of the TCP send buffer
             (SO_SNDBUF) to use when sending data. Default: None (relies on
             system defaults). Java client defaults to 131072.
+        socket_options (list): List of tuple-arguments to socket.setsockopt
+            to apply to broker connection sockets. Default:
+            [(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)]
         reconnect_backoff_ms (int): The amount of time in milliseconds to
             wait before attempting to reconnect to a given host.
             Default: 50.
@@ -194,7 +199,8 @@ class KafkaProducer(object):
             to kafka brokers up to this number of maximum requests per
             broker connection. Default: 5.
         security_protocol (str): Protocol used to communicate with brokers.
-            Valid values are: PLAINTEXT, SSL. Default: PLAINTEXT.
+            Valid values are: PLAINTEXT, SSL, SASL_PLAINTEXT, SASL_SSL.
+            Default: PLAINTEXT.
         ssl_context (ssl.SSLContext): pre-configured SSLContext for wrapping
             socket connections. If provided, all other ssl_* configurations
             will be ignored. Default: None.
@@ -213,18 +219,36 @@ class KafkaProducer(object):
             providing a file, only the leaf certificate will be checked against
             this CRL. The CRL can only be checked with Python 3.4+ or 2.7.9+.
             default: none.
-        api_version (str): specify which kafka API version to use.
-            If set to 'auto', will attempt to infer the broker version by
-            probing various APIs. Default: auto
+        api_version (tuple): specify which kafka API version to use.
+            For a full list of supported versions, see KafkaClient.API_VERSIONS
+            If set to None, the client will attempt to infer the broker version
+            by probing various APIs. Default: None
         api_version_auto_timeout_ms (int): number of milliseconds to throw a
             timeout exception from the constructor when checking the broker
             api version. Only applies if api_version set to 'auto'
+        metric_reporters (list): A list of classes to use as metrics reporters.
+            Implementing the AbstractMetricsReporter interface allows plugging
+            in classes that will be notified of new metric creation. Default: []
+        metrics_num_samples (int): The number of samples maintained to compute
+            metrics. Default: 2
+        metrics_sample_window_ms (int): The maximum age in milliseconds of
+            samples used to compute metrics. Default: 30000
+        selector (selectors.BaseSelector): Provide a specific selector
+            implementation to use for I/O multiplexing.
+            Default: selectors.DefaultSelector
+        sasl_mechanism (str): string picking sasl mechanism when security_protocol
+            is SASL_PLAINTEXT or SASL_SSL. Currently only PLAIN is supported.
+            Default: None
+        sasl_plain_username (str): username for sasl PLAIN authentication.
+            Default: None
+        sasl_plain_password (str): password for sasl PLAIN authentication.
+            Defualt: None
 
     Note:
         Configuration parameters are described in more detail at
-        https://kafka.apache.org/090/configuration.html#producerconfigs
+        https://kafka.apache.org/0100/configuration.html#producerconfigs
     """
-    _DEFAULT_CONFIG = {
+    DEFAULT_CONFIG = {
         'bootstrap_servers': 'localhost',
         'client_id': None,
         'key_serializer': None,
@@ -244,6 +268,7 @@ class KafkaProducer(object):
         'request_timeout_ms': 30000,
         'receive_buffer_bytes': None,
         'send_buffer_bytes': None,
+        'socket_options': [(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)],
         'reconnect_backoff_ms': 50,
         'max_in_flight_requests_per_connection': 5,
         'security_protocol': 'PLAINTEXT',
@@ -253,13 +278,20 @@ class KafkaProducer(object):
         'ssl_certfile': None,
         'ssl_keyfile': None,
         'ssl_crlfile': None,
-        'api_version': 'auto',
-        'api_version_auto_timeout_ms': 2000
+        'api_version': None,
+        'api_version_auto_timeout_ms': 2000,
+        'metric_reporters': [],
+        'metrics_num_samples': 2,
+        'metrics_sample_window_ms': 30000,
+        'selector': selectors.DefaultSelector,
+        'sasl_mechanism': None,
+        'sasl_plain_username': None,
+        'sasl_plain_password': None,
     }
 
     def __init__(self, **configs):
         log.debug("Starting the Kafka producer") # trace
-        self.config = copy.copy(self._DEFAULT_CONFIG)
+        self.config = copy.copy(self.DEFAULT_CONFIG)
         for key in self.config:
             if key in configs:
                 self.config[key] = configs.pop(key)
@@ -274,25 +306,40 @@ class KafkaProducer(object):
         if self.config['acks'] == 'all':
             self.config['acks'] = -1
 
-        client = KafkaClient(**self.config)
+        # api_version was previously a str. accept old format for now
+        if isinstance(self.config['api_version'], str):
+            deprecated = self.config['api_version']
+            if deprecated == 'auto':
+                self.config['api_version'] = None
+            else:
+                self.config['api_version'] = tuple(map(int, deprecated.split('.')))
+            log.warning('use api_version=%s [tuple] -- "%s" as str is deprecated',
+                        str(self.config['api_version']), deprecated)
 
-        # Check Broker Version if not set explicitly
-        if self.config['api_version'] == 'auto':
-            self.config['api_version'] = client.check_version(timeout=(self.config['api_version_auto_timeout_ms']/1000))
-        assert self.config['api_version'] in ('0.10', '0.9', '0.8.2', '0.8.1', '0.8.0')
+        # Configure metrics
+        metrics_tags = {'client-id': self.config['client_id']}
+        metric_config = MetricConfig(samples=self.config['metrics_num_samples'],
+                                     time_window_ms=self.config['metrics_sample_window_ms'],
+                                     tags=metrics_tags)
+        reporters = [reporter() for reporter in self.config['metric_reporters']]
+        self._metrics = Metrics(metric_config, reporters)
 
-        # Convert api_version config to tuple for easy comparisons
-        self.config['api_version'] = tuple(
-            map(int, self.config['api_version'].split('.')))
+        client = KafkaClient(metrics=self._metrics, metric_group_prefix='producer',
+                             **self.config)
+
+        # Get auto-discovered version from client if necessary
+        if self.config['api_version'] is None:
+            self.config['api_version'] = client.config['api_version']
 
         if self.config['compression_type'] == 'lz4':
             assert self.config['api_version'] >= (0, 8, 2), 'LZ4 Requires >= Kafka 0.8.2 Brokers'
 
         message_version = 1 if self.config['api_version'] >= (0, 10) else 0
-        self._accumulator = RecordAccumulator(message_version=message_version, **self.config)
+        self._accumulator = RecordAccumulator(message_version=message_version, metrics=self._metrics, **self.config)
         self._metadata = client.cluster
         guarantee_message_order = bool(self.config['max_in_flight_requests_per_connection'] == 1)
-        self._sender = Sender(client, self._metadata, self._accumulator,
+        self._sender = Sender(client, self._metadata,
+                              self._accumulator, self._metrics,
                               guarantee_message_order=guarantee_message_order,
                               **self.config)
         self._sender.daemon = True
@@ -376,6 +423,7 @@ class KafkaProducer(object):
             if not invoked_from_callback:
                 self._sender.join()
 
+        self._metrics.close()
         try:
             self.config['key_serializer'].close()
         except AttributeError:
@@ -426,6 +474,7 @@ class KafkaProducer(object):
         assert value is not None or self.config['api_version'] >= (0, 8, 1), (
             'Null messages require kafka >= 0.8.1')
         assert not (value is None and key is None), 'Need at least one: key or value'
+        key_bytes = value_bytes = None
         try:
             # first make sure the metadata for the topic is
             # available
@@ -466,10 +515,11 @@ class KafkaProducer(object):
         except Exception as e:
             log.debug("Exception occurred during message send: %s", e)
             return FutureRecordMetadata(
-                FutureProduceResult(
-                    TopicPartition(topic, partition)),
-                    -1, None
-                ).failure(e)
+                FutureProduceResult(TopicPartition(topic, partition)),
+                -1, None, None,
+                len(key_bytes) if key_bytes is not None else -1,
+                len(value_bytes) if value_bytes is not None else -1
+            ).failure(e)
 
     def flush(self, timeout=None):
         """
@@ -575,3 +625,18 @@ class KafkaProducer(object):
         return self.config['partitioner'](serialized_key,
                                           all_partitions,
                                           available)
+
+    def metrics(self, raw=False):
+        """Warning: this is an unstable interface.
+        It may change in future releases without warning"""
+        if raw:
+            return self._metrics.metrics
+
+        metrics = {}
+        for k, v in self._metrics.metrics.items():
+            if k.group not in metrics:
+                metrics[k.group] = {}
+            if k.name not in metrics[k.group]:
+                metrics[k.group][k.name] = {}
+            metrics[k.group][k.name] = v.value()
+        return metrics

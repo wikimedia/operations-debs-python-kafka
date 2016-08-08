@@ -1,3 +1,5 @@
+from __future__ import absolute_import
+
 import atexit
 import binascii
 import collections
@@ -6,7 +8,7 @@ import sys
 from threading import Thread, Event
 import weakref
 
-import six
+from kafka.vendor import six
 
 from kafka.errors import BufferUnderflowError
 

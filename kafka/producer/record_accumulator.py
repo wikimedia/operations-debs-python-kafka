@@ -38,7 +38,7 @@ class AtomicInteger(object):
 class RecordBatch(object):
     def __init__(self, tp, records, message_version=0):
         self.record_count = 0
-        #self.max_record_size = 0 # for metrics only
+        self.max_record_size = 0
         now = time.time()
         self.created = now
         self.drained = None
@@ -56,11 +56,14 @@ class RecordBatch(object):
             return None
 
         msg = Message(value, key=key, magic=self.message_version)
-        self.records.append(self.record_count, msg)
-        # self.max_record_size = max(self.max_record_size, Record.record_size(key, value)) # for metrics only
+        record_size = self.records.append(self.record_count, msg)
+        checksum = msg.crc # crc is recalculated during records.append()
+        self.max_record_size = max(self.max_record_size, record_size)
         self.last_append = time.time()
         future = FutureRecordMetadata(self.produce_future, self.record_count,
-                                      timestamp_ms)
+                                      timestamp_ms, checksum,
+                                      len(key) if key is not None else -1,
+                                      len(value) if value is not None else -1)
         self.record_count += 1
         return future
 
@@ -152,17 +155,19 @@ class RecordAccumulator(object):
             produce request upon receiving an error. This avoids exhausting
             all retries in a short period of time. Default: 100
     """
-    _DEFAULT_CONFIG = {
+    DEFAULT_CONFIG = {
         'buffer_memory': 33554432,
         'batch_size': 16384,
         'compression_type': None,
         'linger_ms': 0,
         'retry_backoff_ms': 100,
         'message_version': 0,
+        'metrics': None,
+        'metric_group_prefix': 'producer-metrics',
     }
 
     def __init__(self, **configs):
-        self.config = copy.copy(self._DEFAULT_CONFIG)
+        self.config = copy.copy(self.DEFAULT_CONFIG)
         for key in self.config:
             if key in configs:
                 self.config[key] = configs.pop(key)
@@ -173,7 +178,9 @@ class RecordAccumulator(object):
         self._batches = collections.defaultdict(collections.deque) # TopicPartition: [RecordBatch]
         self._tp_locks = {None: threading.Lock()} # TopicPartition: Lock, plus a lock to add entries
         self._free = SimpleBufferPool(self.config['buffer_memory'],
-                                      self.config['batch_size'])
+                                      self.config['batch_size'],
+                                      metrics=self.config['metrics'],
+                                      metric_group_prefix=self.config['metric_group_prefix'])
         self._incomplete = IncompleteRecordBatches()
         # The following variables should only be accessed by the sender thread,
         # so we don't need to protect them w/ locking.

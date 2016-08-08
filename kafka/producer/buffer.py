@@ -1,4 +1,4 @@
-from __future__ import absolute_import
+from __future__ import absolute_import, division
 
 import collections
 import io
@@ -9,6 +9,7 @@ from ..codec import (has_gzip, has_snappy, has_lz4,
                      gzip_encode, snappy_encode,
                      lz4_encode, lz4_encode_old_kafka)
 from .. import errors as Errors
+from ..metrics.stats import Rate
 from ..protocol.types import Int32, Int64
 from ..protocol.message import MessageSet, Message
 
@@ -55,13 +56,17 @@ class MessageSetBuffer(object):
         self._batch_size = batch_size
         self._closed = False
         self._messages = 0
+        self._bytes_written = 4 # Int32 header is 4 bytes
+        self._final_size = None
 
     def append(self, offset, message):
-        """Apend a Message to the MessageSet.
+        """Append a Message to the MessageSet.
 
         Arguments:
             offset (int): offset of the message
             message (Message or bytes): message struct or encoded bytes
+
+        Returns: bytes written
         """
         if isinstance(message, Message):
             encoded = message.encode()
@@ -70,6 +75,8 @@ class MessageSetBuffer(object):
         msg = Int64.encode(offset) + Int32.encode(len(encoded)) + encoded
         self._buffer.write(msg)
         self._messages += 1
+        self._bytes_written += len(msg)
+        return len(msg)
 
     def has_room_for(self, key, value):
         if self._closed:
@@ -97,8 +104,9 @@ class MessageSetBuffer(object):
         if not self._closed:
             if self._compressor:
                 # TODO: avoid copies with bytearray / memoryview
+                uncompressed_size = self._buffer.tell()
                 self._buffer.seek(4)
-                msg = Message(self._compressor(self._buffer.read()),
+                msg = Message(self._compressor(self._buffer.read(uncompressed_size - 4)),
                               attributes=self._compression_attributes,
                               magic=self._message_version)
                 encoded = msg.encode()
@@ -107,16 +115,20 @@ class MessageSetBuffer(object):
                 self._buffer.write(Int32.encode(len(encoded)))
                 self._buffer.write(encoded)
 
-            # Update the message set size, and return ready for full read()
-            size = self._buffer.tell() - 4
+            # Update the message set size (less the 4 byte header),
+            # and return with buffer ready for full read()
+            self._final_size = self._buffer.tell()
             self._buffer.seek(0)
-            self._buffer.write(Int32.encode(size))
+            self._buffer.write(Int32.encode(self._final_size - 4))
 
         self._buffer.seek(0)
         self._closed = True
 
     def size_in_bytes(self):
-        return self._buffer.tell()
+        return self._final_size or self._buffer.tell()
+
+    def compression_rate(self):
+        return self.size_in_bytes() / self._bytes_written
 
     def buffer(self):
         return self._buffer
@@ -124,7 +136,7 @@ class MessageSetBuffer(object):
 
 class SimpleBufferPool(object):
     """A simple pool of BytesIO objects with a weak memory ceiling."""
-    def __init__(self, memory, poolable_size):
+    def __init__(self, memory, poolable_size, metrics=None, metric_group_prefix='producer-metrics'):
         """Create a new buffer pool.
 
         Arguments:
@@ -139,10 +151,13 @@ class SimpleBufferPool(object):
         self._free = collections.deque([io.BytesIO() for _ in range(buffers)])
 
         self._waiters = collections.deque()
-        #self.metrics = metrics;
-        #self.waitTime = this.metrics.sensor("bufferpool-wait-time");
-        #MetricName metricName = metrics.metricName("bufferpool-wait-ratio", metricGrpName, "The fraction of time an appender waits for space allocation.");
-        #this.waitTime.add(metricName, new Rate(TimeUnit.NANOSECONDS));
+        self.wait_time = None
+        if metrics:
+            self.wait_time = metrics.sensor('bufferpool-wait-time')
+            self.wait_time.add(metrics.metric_name(
+                'bufferpool-wait-ratio', metric_group_prefix,
+                'The fraction of time an appender waits for space allocation.'),
+                Rate())
 
     def allocate(self, size, max_time_to_block_ms):
         """
@@ -176,7 +191,8 @@ class SimpleBufferPool(object):
                     start_wait = time.time()
                     more_memory.wait(max_time_to_block_ms / 1000.0)
                     end_wait = time.time()
-                    #this.waitTime.record(endWait - startWait, time.milliseconds());
+                    if self.wait_time:
+                        self.wait_time.record(end_wait - start_wait)
 
                     if self._free:
                         buf = self._free.popleft()

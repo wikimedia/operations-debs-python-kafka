@@ -1,3 +1,5 @@
+from __future__ import absolute_import
+
 import io
 import time
 
@@ -143,7 +145,7 @@ class MessageSet(AbstractType):
     HEADER_SIZE = 12 # offset + message_size
 
     @classmethod
-    def encode(cls, items, size=True, recalc_message_size=True):
+    def encode(cls, items):
         # RecordAccumulator encodes messagesets internally
         if isinstance(items, io.BytesIO):
             size = Int32.decode(items)
@@ -156,8 +158,6 @@ class MessageSet(AbstractType):
             encoded_values.append(Int64.encode(offset))
             encoded_values.append(Bytes.encode(message))
         encoded = b''.join(encoded_values)
-        if not size:
-            return encoded
         return Bytes.encode(encoded)
 
     @classmethod
