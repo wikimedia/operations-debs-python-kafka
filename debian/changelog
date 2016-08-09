@@ -1,3 +1,9 @@
+python-kafka (1.3.1-1) stable; urgency=low
+
+  * 1.3.1 release
+
+ -- Andrew Otto (WMF) <otto@wikimedia.org>  Wed, 98 Aug 2016 17:19:52 +0000
+
 python-kafka (1.3.0-1) stable; urgency=low
 
   * 1.3.0 release
