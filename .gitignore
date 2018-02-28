@@ -12,3 +12,6 @@ servers/*/resources/ssl*
 docs/_build
 .cache*
 .idea/
+integration-test/
+tests-env/
+.pytest_cache/

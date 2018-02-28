@@ -4,7 +4,6 @@ import atexit
 import binascii
 import collections
 import struct
-import sys
 from threading import Thread, Event
 import weakref
 
@@ -13,14 +12,20 @@ from kafka.vendor import six
 from kafka.errors import BufferUnderflowError
 
 
-def crc32(data):
-    crc = binascii.crc32(data)
-    # py2 and py3 behave a little differently
-    # CRC is encoded as a signed int in kafka protocol
-    # so we'll convert the py3 unsigned result to signed
-    if six.PY3 and crc >= 2**31:
-        crc -= 2**32
-    return crc
+if six.PY3:
+    MAX_INT = 2 ** 31
+    TO_SIGNED = 2 ** 32
+
+    def crc32(data):
+        crc = binascii.crc32(data)
+        # py2 and py3 behave a little differently
+        # CRC is encoded as a signed int in kafka protocol
+        # so we'll convert the py3 unsigned result to signed
+        if crc >= MAX_INT:
+            crc -= TO_SIGNED
+        return crc
+else:
+    from binascii import crc32
 
 
 def write_int_string(s):
@@ -33,19 +38,6 @@ def write_int_string(s):
         return struct.pack('>i%ds' % len(s), len(s), s)
 
 
-def write_short_string(s):
-    if s is not None and not isinstance(s, six.binary_type):
-        raise TypeError('Expected "%s" to be bytes\n'
-                        'data=%s' % (type(s), repr(s)))
-    if s is None:
-        return struct.pack('>h', -1)
-    elif len(s) > 32767 and sys.version_info < (2, 7):
-        # Python 2.6 issues a deprecation warning instead of a struct error
-        raise struct.error(len(s))
-    else:
-        return struct.pack('>h%ds' % len(s), len(s), s)
-
-
 def read_short_string(data, cur):
     if len(data) < cur + 2:
         raise BufferUnderflowError("Not enough data left")
@@ -55,24 +47,6 @@ def read_short_string(data, cur):
         return None, cur + 2
 
     cur += 2
-    if len(data) < cur + strlen:
-        raise BufferUnderflowError("Not enough data left")
-
-    out = data[cur:cur + strlen]
-    return out, cur + strlen
-
-
-def read_int_string(data, cur):
-    if len(data) < cur + 4:
-        raise BufferUnderflowError(
-            "Not enough data left to read string len (%d < %d)" %
-            (len(data), cur + 4))
-
-    (strlen,) = struct.unpack('>i', data[cur:cur + 4])
-    if strlen == -1:
-        return None, cur + 4
-
-    cur += 4
     if len(data) < cur + strlen:
         raise BufferUnderflowError("Not enough data left")
 
@@ -191,6 +165,14 @@ class WeakMethod(object):
         if not isinstance(other, WeakMethod):
             return False
         return self._target_id == other._target_id and self._method_id == other._method_id
+
+
+class Dict(dict):
+    """Utility class to support passing weakrefs to dicts
+
+    See: https://docs.python.org/2/library/weakref.html
+    """
+    pass
 
 
 def try_method_on_system_exit(obj, method, *args, **kwargs):

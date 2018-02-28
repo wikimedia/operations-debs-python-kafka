@@ -1,9 +1,10 @@
 from __future__ import absolute_import
 
-from .roundrobin import RoundRobinPartitioner
-from .hashed import HashedPartitioner, Murmur2Partitioner, LegacyPartitioner
+from kafka.partitioner.default import DefaultPartitioner
+from kafka.partitioner.hashed import HashedPartitioner, Murmur2Partitioner, LegacyPartitioner
+from kafka.partitioner.roundrobin import RoundRobinPartitioner
 
 __all__ = [
-    'RoundRobinPartitioner', 'HashedPartitioner', 'Murmur2Partitioner',
-    'LegacyPartitioner'
+    'DefaultPartitioner', 'RoundRobinPartitioner', 'HashedPartitioner',
+    'Murmur2Partitioner', 'LegacyPartitioner'
 ]

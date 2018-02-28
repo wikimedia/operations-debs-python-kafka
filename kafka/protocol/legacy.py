@@ -3,9 +3,7 @@ from __future__ import absolute_import
 import logging
 import struct
 
-from kafka.vendor import six # pylint: disable=import-error
-
-from kafka.vendor.six.moves import xrange # pylint: disable=import-error
+from kafka.vendor import six  # pylint: disable=import-error
 
 import kafka.protocol.commit
 import kafka.protocol.fetch
@@ -15,13 +13,13 @@ import kafka.protocol.offset
 import kafka.protocol.produce
 import kafka.structs
 
-from kafka.codec import (
-    gzip_encode, gzip_decode, snappy_encode, snappy_decode)
-from kafka.errors import ProtocolError, ChecksumError, UnsupportedCodecError
+from kafka.codec import gzip_encode, snappy_encode
+from kafka.errors import ProtocolError, UnsupportedCodecError
 from kafka.structs import ConsumerMetadataResponse
 from kafka.util import (
-    crc32, read_short_string, read_int_string, relative_unpack,
-    write_short_string, write_int_string, group_by_topic_and_partition)
+    crc32, read_short_string, relative_unpack,
+    write_int_string, group_by_topic_and_partition)
+from kafka.protocol.message import MessageSet
 
 
 log = logging.getLogger(__name__)
@@ -136,21 +134,26 @@ class KafkaProtocol(object):
         if acks not in (1, 0, -1):
             raise ValueError('ProduceRequest acks (%s) must be 1, 0, -1' % acks)
 
+        topics = []
+        for topic, topic_payloads in group_by_topic_and_partition(payloads).items():
+            topic_msgs = []
+            for partition, payload in topic_payloads.items():
+                partition_msgs = []
+                for msg in payload.messages:
+                    m = kafka.protocol.message.Message(
+                          msg.value, key=msg.key,
+                          magic=msg.magic, attributes=msg.attributes
+                    )
+                    partition_msgs.append((0, m.encode()))
+                topic_msgs.append((partition, MessageSet.encode(partition_msgs, prepend_size=False)))
+            topics.append((topic, topic_msgs))
+
+
         return kafka.protocol.produce.ProduceRequest[0](
             required_acks=acks,
             timeout=timeout,
-            topics=[(
-                topic,
-                [(
-                    partition,
-                    [(0,
-                      kafka.protocol.message.Message(
-                          msg.value, key=msg.key,
-                          magic=msg.magic, attributes=msg.attributes
-                      ).encode())
-                    for msg in payload.messages])
-                for partition, payload in topic_payloads.items()])
-            for topic, topic_payloads in group_by_topic_and_partition(payloads).items()])
+            topics=topics
+        )
 
     @classmethod
     def decode_produce_response(cls, response):
@@ -213,7 +216,8 @@ class KafkaProtocol(object):
         ]
 
     @classmethod
-    def decode_message_set(cls, messages):
+    def decode_message_set(cls, raw_data):
+        messages = MessageSet.decode(raw_data, bytes_to_read=len(raw_data))
         for offset, _, message in messages:
             if isinstance(message, kafka.protocol.message.Message) and message.is_compressed():
                 inner_messages = message.decompress()
@@ -250,6 +254,35 @@ class KafkaProtocol(object):
             for topic, partitions in response.topics
             for partition, error, offsets in partitions
         ]
+
+    @classmethod
+    def encode_list_offset_request(cls, payloads=()):
+        return kafka.protocol.offset.OffsetRequest[1](
+            replica_id=-1,
+            topics=[(
+                topic,
+                [(
+                    partition,
+                    payload.time)
+                for partition, payload in six.iteritems(topic_payloads)])
+            for topic, topic_payloads in six.iteritems(group_by_topic_and_partition(payloads))])
+
+    @classmethod
+    def decode_list_offset_response(cls, response):
+        """
+        Decode OffsetResponse_v2 into ListOffsetResponsePayloads
+
+        Arguments:
+            response: OffsetResponse_v2
+
+        Returns: list of ListOffsetResponsePayloads
+        """
+        return [
+            kafka.structs.ListOffsetResponsePayload(topic, partition, error, timestamp, offset)
+            for topic, partitions in response.topics
+            for partition, error, timestamp, offset in partitions
+        ]
+
 
     @classmethod
     def encode_metadata_request(cls, topics=(), payloads=None):
@@ -319,7 +352,6 @@ class KafkaProtocol(object):
                     payload.metadata)
                 for partition, payload in six.iteritems(topic_payloads)])
             for topic, topic_payloads in six.iteritems(group_by_topic_and_partition(payloads))])
-
 
     @classmethod
     def decode_offset_commit_response(cls, response):

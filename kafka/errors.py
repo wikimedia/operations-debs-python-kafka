@@ -33,7 +33,11 @@ class NodeNotReadyError(KafkaError):
     retriable = True
 
 
-class CorrelationIdError(KafkaError):
+class KafkaProtocolError(KafkaError):
+    retriable = True
+
+
+class CorrelationIdError(KafkaProtocolError):
     retriable = True
 
 
@@ -55,7 +59,18 @@ class UnrecognizedBrokerVersion(KafkaError):
 
 
 class CommitFailedError(KafkaError):
-    pass
+    def __init__(self, *args, **kwargs):
+        super(CommitFailedError, self).__init__(
+            """Commit cannot be completed since the group has already
+            rebalanced and assigned the partitions to another member.
+            This means that the time between subsequent calls to poll()
+            was longer than the configured max_poll_interval_ms, which
+            typically implies that the poll loop is spending too much
+            time message processing. You can address this either by
+            increasing the rebalance timeout with max_poll_interval_ms,
+            or by reducing the maximum size of batches returned in poll()
+            with max_poll_records.
+            """, *args, **kwargs)
 
 
 class AuthenticationMethodNotSupported(KafkaError):
@@ -73,10 +88,9 @@ class BrokerResponseError(KafkaError):
 
     def __str__(self):
         """Add errno to standard KafkaError str"""
-        return '[Error {0}] {1}: {2}'.format(
+        return '[Error {0}] {1}'.format(
             self.errno,
-            self.__class__.__name__,
-            super(KafkaError, self).__str__()) # pylint: disable=bad-super-call
+            super(BrokerResponseError, self).__str__())
 
 
 class NoError(BrokerResponseError):
@@ -98,11 +112,14 @@ class OffsetOutOfRangeError(BrokerResponseError):
                    ' maintained by the server for the given topic/partition.')
 
 
-class InvalidMessageError(BrokerResponseError):
+class CorruptRecordException(BrokerResponseError):
     errno = 2
-    message = 'INVALID_MESSAGE'
+    message = 'CORRUPT_MESSAGE'
     description = ('This message has failed its CRC checksum, exceeds the'
                    ' valid size, or is otherwise corrupt.')
+
+# Backward compatibility
+InvalidMessageError = CorruptRecordException
 
 
 class UnknownTopicOrPartitionError(BrokerResponseError):
@@ -110,6 +127,7 @@ class UnknownTopicOrPartitionError(BrokerResponseError):
     message = 'UNKNOWN_TOPIC_OR_PARTITION'
     description = ('This request is for a topic or partition that does not'
                    ' exist on this broker.')
+    retriable = True
     invalid_metadata = True
 
 
@@ -153,6 +171,7 @@ class BrokerNotAvailableError(BrokerResponseError):
     message = 'BROKER_NOT_AVAILABLE'
     description = ('This is not a client facing error and is used mostly by'
                    ' tools when a broker is not alive.')
+
 
 class ReplicaNotAvailableError(BrokerResponseError):
     errno = 9
@@ -270,7 +289,8 @@ class InconsistentGroupProtocolError(BrokerResponseError):
     errno = 23
     message = 'INCONSISTENT_GROUP_PROTOCOL'
     description = ('Returned in join group when the member provides a protocol'
-                   ' type or set of protocols which is not compatible with the current group.')
+                   ' type or set of protocols which is not compatible with the'
+                   ' current group.')
 
 
 class InvalidGroupIdError(BrokerResponseError):
@@ -333,19 +353,84 @@ class ClusterAuthorizationFailedError(BrokerResponseError):
 class InvalidTimestampError(BrokerResponseError):
     errno = 32
     message = 'INVALID_TIMESTAMP'
-    description = ('The timestamp of the message is out of acceptable range.')
+    description = 'The timestamp of the message is out of acceptable range.'
 
 
 class UnsupportedSaslMechanismError(BrokerResponseError):
     errno = 33
     message = 'UNSUPPORTED_SASL_MECHANISM'
-    description = ('The broker does not support the requested SASL mechanism.')
+    description = 'The broker does not support the requested SASL mechanism.'
 
 
 class IllegalSaslStateError(BrokerResponseError):
     errno = 34
     message = 'ILLEGAL_SASL_STATE'
-    description = ('Request is not valid given the current SASL state.')
+    description = 'Request is not valid given the current SASL state.'
+
+
+class UnsupportedVersionError(BrokerResponseError):
+    errno = 35
+    message = 'UNSUPPORTED_VERSION'
+    description = 'The version of API is not supported.'
+
+
+class TopicAlreadyExistsError(BrokerResponseError):
+    errno = 36
+    message = 'TOPIC_ALREADY_EXISTS'
+    description = 'Topic with this name already exists.'
+
+
+class InvalidPartitionsError(BrokerResponseError):
+    errno = 37
+    message = 'INVALID_PARTITIONS'
+    description = 'Number of partitions is invalid.'
+
+
+class InvalidReplicationFactorError(BrokerResponseError):
+    errno = 38
+    message = 'INVALID_REPLICATION_FACTOR'
+    description = 'Replication-factor is invalid.'
+
+
+class InvalidReplicationAssignmentError(BrokerResponseError):
+    errno = 39
+    message = 'INVALID_REPLICATION_ASSIGNMENT'
+    description = 'Replication assignment is invalid.'
+
+
+class InvalidConfigurationError(BrokerResponseError):
+    errno = 40
+    message = 'INVALID_CONFIG'
+    description = 'Configuration is invalid.'
+
+
+class NotControllerError(BrokerResponseError):
+    errno = 41
+    message = 'NOT_CONTROLLER'
+    description = 'This is not the correct controller for this cluster.'
+    retriable = True
+
+
+class InvalidRequestError(BrokerResponseError):
+    errno = 42
+    message = 'INVALID_REQUEST'
+    description = ('This most likely occurs because of a request being'
+                   ' malformed by the client library or the message was'
+                   ' sent to an incompatible broker. See the broker logs'
+                   ' for more details.')
+
+
+class UnsupportedForMessageFormatError(BrokerResponseError):
+    errno = 43
+    message = 'UNSUPPORTED_FOR_MESSAGE_FORMAT'
+    description = ('The message format version on the broker does not'
+                   ' support this request.')
+
+
+class PolicyViolationError(BrokerResponseError):
+    errno = 44
+    message = 'POLICY_VIOLATION'
+    description = 'Request parameters do not satisfy the configured policy.'
 
 
 class KafkaUnavailableError(KafkaError):
