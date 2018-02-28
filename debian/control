@@ -2,7 +2,9 @@ Source: python-kafka
 Maintainer: Andrew Otto (WMF) <otto@wikimedia.org>
 Section: python
 Priority: optional
-Build-Depends: python, debhelper (>= 9), python-setuptools
+Build-Depends: python, debhelper (>= 9), dh-python,
+  python-all (>= 2.7), python-setuptools, python-dev,
+  python3-all, python3-setuptools, python3-dev,
 Standards-Version: 3.9.5
 Vcs-Git: https://gerrit.wikimedia.org/r/operations/debs/python-kafka -b debian
 Vcs-Browser: http://git.wikimedia.org/tree/operations%2Fdebs%2Fpython-kafka.git/refs%2Fheads%2Fdebian
@@ -12,6 +14,17 @@ Architecture: all
 Depends: ${misc:Depends}, ${python:Depends}
 Suggests: python-snappy
 Provides: ${python:Provides}
+Description: Pure Python client for Apache Kafka
+ This Python module provides low-level protocol support for Apache Kafka as well
+ as high-level consumer and producer classes. Request batching is supported by
+ the protocol as well as broker-aware request routing. Gzip and Snappy
+ compression is also supported for message sets.
+
+Package: python3-kafka
+Architecture: all
+Depends: ${misc:Depends}, ${python3:Depends}
+Suggests: python-snappy
+Provides: ${python3:Provides}
 Description: Pure Python client for Apache Kafka
  This Python module provides low-level protocol support for Apache Kafka as well
  as high-level consumer and producer classes. Request batching is supported by
