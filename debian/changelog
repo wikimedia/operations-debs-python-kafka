@@ -1,3 +1,9 @@
+python-kafka (1.4.3-2~wmf0) staable; urgency=medium
+
+  * Backport https://github.com/dpkp/kafka-python/pull/1628
+
+ -- Andrew Otto (WMF) <otto@wikimediaa.org>  Fri, 10 May 2019 14:09:22 +0000
+
 python-kafka (1.4.3-1) stable; urgency=low
 
   * 1.4.3 release

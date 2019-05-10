@@ -1,0 +1,27 @@
+Backport https://github.com/dpkp/kafka-python/pull/1628
+(Attempt to) Fix deadlock between consumer and heartbeat 
+Bug: T221848
+--- a/kafka/client_async.py
++++ b/kafka/client_async.py
+@@ -555,9 +555,7 @@
+ 
+                 self._poll(timeout)
+ 
+-            # called without the lock to avoid deadlock potential
+-            # if handlers need to acquire locks
+-            responses.extend(self._fire_pending_completed_requests())
++                responses.extend(self._fire_pending_completed_requests())
+ 
+             # If all we had was a timeout (future is None) - only do one poll
+             # If we do have a future, we keep looping until it is done
+--- a/kafka/coordinator/base.py
++++ b/kafka/coordinator/base.py
+@@ -347,7 +347,7 @@
+ 
+     def ensure_active_group(self):
+         """Ensure that the group is active (i.e. joined and synced)"""
+-        with self._lock:
++        with self._client._lock, self._lock:
+             if self._heartbeat_thread is None:
+                 self._start_heartbeat_thread()
+ 
