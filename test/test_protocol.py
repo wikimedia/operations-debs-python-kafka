@@ -3,7 +3,6 @@ import io
 import struct
 
 import pytest
-import six
 
 from kafka.protocol.api import RequestHeader
 from kafka.protocol.commit import GroupCoordinatorRequest

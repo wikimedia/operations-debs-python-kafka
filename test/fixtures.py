@@ -4,35 +4,24 @@ import atexit
 import logging
 import os
 import os.path
-import random
 import socket
-import string
 import subprocess
 import time
 import uuid
 
 import py
-from six.moves import urllib, xrange
-from six.moves.urllib.parse import urlparse  # pylint: disable=E0611,F0401
+from kafka.vendor.six.moves import urllib, range
+from kafka.vendor.six.moves.urllib.parse import urlparse  # pylint: disable=E0611,F0401
 
 from kafka import errors, KafkaConsumer, KafkaProducer, SimpleClient
 from kafka.client_async import KafkaClient
 from kafka.protocol.admin import CreateTopicsRequest
 from kafka.protocol.metadata import MetadataRequest
+from test.testutil import env_kafka_version, random_string
 from test.service import ExternalService, SpawnedService
 
 log = logging.getLogger(__name__)
 
-def random_string(length):
-    return "".join(random.choice(string.ascii_letters) for i in xrange(length))
-
-def version_str_to_list(version_str):
-    return tuple(map(int, version_str.split('.'))) # e.g., (0, 8, 1, 1)
-
-def version():
-    if 'KAFKA_VERSION' not in os.environ:
-        return ()
-    return version_str_to_list(os.environ['KAFKA_VERSION'])
 
 def get_open_port():
     sock = socket.socket()
@@ -41,6 +30,37 @@ def get_open_port():
     sock.close()
     return port
 
+
+def gen_ssl_resources(directory):
+    os.system("""
+    cd {0}
+    echo Generating SSL resources in {0}
+
+    # Step 1
+    keytool -keystore kafka.server.keystore.jks -alias localhost -validity 1 \
+      -genkey -storepass foobar -keypass foobar \
+      -dname "CN=localhost, OU=kafka-python, O=kafka-python, L=SF, ST=CA, C=US" \
+      -ext SAN=dns:localhost
+
+    # Step 2
+    openssl genrsa -out ca-key 2048
+    openssl req -new -x509 -key ca-key -out ca-cert -days 1 \
+      -subj "/C=US/ST=CA/O=MyOrg, Inc./CN=mydomain.com"
+    keytool -keystore kafka.server.truststore.jks -alias CARoot -import \
+      -file ca-cert -storepass foobar -noprompt
+
+    # Step 3
+    keytool -keystore kafka.server.keystore.jks -alias localhost -certreq \
+      -file cert-file -storepass foobar
+    openssl x509 -req -CA ca-cert -CAkey ca-key -in cert-file -out cert-signed \
+      -days 1 -CAcreateserial -passin pass:foobar
+    keytool -keystore kafka.server.keystore.jks -alias CARoot -import \
+      -file ca-cert -storepass foobar -noprompt
+    keytool -keystore kafka.server.keystore.jks -alias localhost -import \
+      -file cert-signed -storepass foobar -noprompt
+    """.format(directory))
+
+
 class Fixture(object):
     kafka_version = os.environ.get('KAFKA_VERSION', '0.11.0.2')
     scala_version = os.environ.get("SCALA_VERSION", '2.8.0')
@@ -48,7 +68,6 @@ class Fixture(object):
                                   os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
     kafka_root = os.environ.get("KAFKA_ROOT",
                                 os.path.join(project_root, 'servers', kafka_version, "kafka-bin"))
-    ivy_root = os.environ.get('IVY_ROOT', os.path.expanduser("~/.ivy2/cache"))
 
     def __init__(self):
         self.child = None
@@ -103,7 +122,7 @@ class Fixture(object):
     def kafka_run_class_env(self):
         env = os.environ.copy()
         env['KAFKA_LOG4J_OPTS'] = "-Dlog4j.configuration=file:%s" % \
-                                  self.test_resource("log4j.properties")
+                                  (self.test_resource("log4j.properties"),)
         return env
 
     @classmethod
@@ -111,7 +130,7 @@ class Fixture(object):
         log.info('Rendering %s from template %s', target_file.strpath, source_file)
         with open(source_file, "r") as handle:
             template = handle.read()
-            assert len(template) > 0, 'Empty template %s' % source_file
+            assert len(template) > 0, 'Empty template %s' % (source_file,)
         with open(target_file.strpath, "w") as handle:
             handle.write(template.format(**binding))
             handle.flush()
@@ -125,6 +144,7 @@ class Fixture(object):
 
     def dump_logs(self):
         self.child.dump_logs()
+
 
 class ZookeeperFixture(Fixture):
     @classmethod
@@ -258,7 +278,7 @@ class KafkaFixture(Fixture):
         # TODO: checking for port connection would be better than scanning logs
         # until then, we need the pattern to work across all supported broker versions
         # The logging format changed slightly in 1.0.0
-        self.start_pattern = r"\[Kafka ?Server (id=)?%d\],? started" % broker_id
+        self.start_pattern = r"\[Kafka ?Server (id=)?%d\],? started" % (broker_id,)
 
         self.zookeeper = zookeeper
         self.zk_chroot = zk_chroot
@@ -292,15 +312,17 @@ class KafkaFixture(Fixture):
                                          "%s:%d" % (self.zookeeper.host,
                                                     self.zookeeper.port),
                                          "create",
-                                         "/%s" % self.zk_chroot,
+                                         "/%s" % (self.zk_chroot,),
                                          "kafka-python")
         env = self.kafka_run_class_env()
         proc = subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-        if proc.wait() != 0 or proc.returncode != 0:
+        stdout, stderr = proc.communicate()
+
+        if proc.returncode != 0:
             self.out("Failed to create Zookeeper chroot node")
-            self.out(proc.stdout.read())
-            self.out(proc.stderr.read())
+            self.out(stdout)
+            self.out(stderr)
             raise RuntimeError("Failed to create Zookeeper chroot node")
         self.out("Kafka chroot created in Zookeeper!")
 
@@ -404,10 +426,11 @@ class KafkaFixture(Fixture):
         retries = 10
         while True:
             node_id = self._client.least_loaded_node()
-            for ready_retry in range(40):
-                if self._client.ready(node_id, False):
+            for connect_retry in range(40):
+                self._client.maybe_connect(node_id)
+                if self._client.connected(node_id):
                     break
-                time.sleep(.1)
+                self._client.poll(timeout_ms=100)
             else:
                 raise RuntimeError('Could not connect to broker with node id %d' % (node_id,))
 
@@ -435,7 +458,7 @@ class KafkaFixture(Fixture):
            num_partitions == self.partitions and \
            replication_factor == self.replicas:
             self._send_request(MetadataRequest[0]([topic_name]))
-        elif version() >= (0, 10, 1, 0):
+        elif env_kafka_version() >= (0, 10, 1, 0):
             request = CreateTopicsRequest[0]([(topic_name, num_partitions,
                                                replication_factor, [], [])], timeout_ms)
             result = self._send_request(request, timeout=timeout_ms)
@@ -455,17 +478,16 @@ class KafkaFixture(Fixture):
                                              '--replication-factor', self.replicas \
                                                  if replication_factor is None \
                                                  else replication_factor)
-            if version() >= (0, 10):
+            if env_kafka_version() >= (0, 10):
                 args.append('--if-not-exists')
             env = self.kafka_run_class_env()
             proc = subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            ret = proc.wait()
-            if ret != 0 or proc.returncode != 0:
-                output = proc.stdout.read()
-                if not 'kafka.common.TopicExistsException' in output:
+            stdout, stderr = proc.communicate()
+            if proc.returncode != 0:
+                if 'kafka.common.TopicExistsException' not in stdout:
                     self.out("Failed to create topic %s" % (topic_name,))
-                    self.out(output)
-                    self.out(proc.stderr.read())
+                    self.out(stdout)
+                    self.out(stderr)
                     raise RuntimeError("Failed to create topic %s" % (topic_name,))
 
     def create_topics(self, topic_names, num_partitions=None, replication_factor=None):

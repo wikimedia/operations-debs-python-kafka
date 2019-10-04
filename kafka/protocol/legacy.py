@@ -15,7 +15,6 @@ import kafka.structs
 
 from kafka.codec import gzip_encode, snappy_encode
 from kafka.errors import ProtocolError, UnsupportedCodecError
-from kafka.structs import ConsumerMetadataResponse
 from kafka.util import (
     crc32, read_short_string, relative_unpack,
     write_int_string, group_by_topic_and_partition)
@@ -322,7 +321,7 @@ class KafkaProtocol(object):
     @classmethod
     def decode_consumer_metadata_response(cls, data):
         """
-        Decode bytes to a ConsumerMetadataResponse
+        Decode bytes to a kafka.structs.ConsumerMetadataResponse
 
         Arguments:
             data: bytes to decode
@@ -331,7 +330,7 @@ class KafkaProtocol(object):
         (host, cur) = read_short_string(data, cur)
         ((port,), cur) = relative_unpack('>i', data, cur)
 
-        return ConsumerMetadataResponse(error, nodeId, host, port)
+        return kafka.structs.ConsumerMetadataResponse(error, nodeId, host, port)
 
     @classmethod
     def encode_offset_commit_request(cls, group, payloads):
@@ -472,4 +471,4 @@ def create_message_set(messages, codec=CODEC_NONE, key=None, compresslevel=None)
     elif codec == CODEC_SNAPPY:
         return [create_snappy_message(messages, key)]
     else:
-        raise UnsupportedCodecError("Codec 0x%02x unsupported" % codec)
+        raise UnsupportedCodecError("Codec 0x%02x unsupported" % (codec,))

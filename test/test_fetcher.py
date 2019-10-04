@@ -12,16 +12,16 @@ from kafka.consumer.fetcher import (
     CompletedFetch, ConsumerRecord, Fetcher, NoOffsetForPartitionError
 )
 from kafka.consumer.subscription_state import SubscriptionState
+from kafka.future import Future
 from kafka.metrics import Metrics
 from kafka.protocol.fetch import FetchRequest, FetchResponse
 from kafka.protocol.offset import OffsetResponse
-from kafka.structs import TopicPartition
-from kafka.future import Future
 from kafka.errors import (
     StaleMetadata, LeaderNotAvailableError, NotLeaderForPartitionError,
     UnknownTopicOrPartitionError, OffsetOutOfRangeError
 )
 from kafka.record.memory_records import MemoryRecordsBuilder, MemoryRecords
+from kafka.structs import TopicPartition
 
 
 @pytest.fixture
@@ -81,7 +81,7 @@ def test_send_fetches(fetcher, topic, mocker):
 
     ret = fetcher.send_fetches()
     for node, request in enumerate(fetch_requests):
-        fetcher._client.send.assert_any_call(node, request)
+        fetcher._client.send.assert_any_call(node, request, wakeup=False)
     assert len(ret) == len(fetch_requests)
 
 
@@ -137,10 +137,6 @@ def test__reset_offset(fetcher, mocker):
     fetcher._subscriptions.assign_from_subscribed([tp])
     fetcher._subscriptions.need_offset_reset(tp)
     mocked = mocker.patch.object(fetcher, '_retrieve_offsets')
-
-    mocked.return_value = {}
-    with pytest.raises(NoOffsetForPartitionError):
-        fetcher._reset_offset(tp)
 
     mocked.return_value = {tp: (1001, None)}
     fetcher._reset_offset(tp)
@@ -509,7 +505,7 @@ def test_partition_records_offset():
     fetch_offset = 123
     tp = TopicPartition('foo', 0)
     messages = [ConsumerRecord(tp.topic, tp.partition, i,
-                               None, None, 'key', 'value', 'checksum', 0, 0)
+                               None, None, 'key', 'value', [], 'checksum', 0, 0, -1)
                 for i in range(batch_start, batch_end)]
     records = Fetcher.PartitionRecords(fetch_offset, None, messages)
     assert len(records) > 0
@@ -534,7 +530,7 @@ def test_partition_records_no_fetch_offset():
     fetch_offset = 123
     tp = TopicPartition('foo', 0)
     messages = [ConsumerRecord(tp.topic, tp.partition, i,
-                               None, None, 'key', 'value', 'checksum', 0, 0)
+                               None, None, 'key', 'value', None, 'checksum', 0, 0, -1)
                 for i in range(batch_start, batch_end)]
     records = Fetcher.PartitionRecords(fetch_offset, None, messages)
     assert len(records) == 0
@@ -549,7 +545,7 @@ def test_partition_records_compacted_offset():
     fetch_offset = 42
     tp = TopicPartition('foo', 0)
     messages = [ConsumerRecord(tp.topic, tp.partition, i,
-                               None, None, 'key', 'value', 'checksum', 0, 0)
+                               None, None, 'key', 'value', None, 'checksum', 0, 0, -1)
                 for i in range(batch_start, batch_end) if i != fetch_offset]
     records = Fetcher.PartitionRecords(fetch_offset, None, messages)
     assert len(records) == batch_end - fetch_offset - 1
